@@ -5,13 +5,15 @@ A fresh session will implement from this document, so it contains the locked dec
 
 ---
 
-## 0. Workflow conventions
-- Always use the codegraph skill to browse and search in code (see the relevant SKILL file)
+## 0. IMPORTANT GENERAL INSTRUCTION !!!
+- Always use the codegraph skill to browse, search and inspect flows in code (see the relevant SKILL in ~/SKILLS/codegraph/)
 - NEVER COMMIT WITHOUT PRIOR USER APPROVAL
-- NEVER GIT PUSH !!!! Only the user can git push !!
-- Keep the code simple and clean, don't blidly copy code around, always look at the surroundings.
+- !!!! NEVER GIT PUSH !!!! Only the user can git push !!!!
+- Keep the code simple and clean, don't blidly copy code around; always look at the surroundings, rename symbols to fit new places.
 - Don't write comments in code, unless strictly necessary.
-- Propose before implementing, discuss instead of thinking log, user like to discuss and approve.
+- ALWAYS Propose before modify anythhing. Discuss instead of thinking long. User like to discuss with you to find extraordinary solutions TOGETHER.
+- We would like to have proper tests for all agent features (where doable)
+- Re-read this file a few time per session, to keep the focus on these IMPORTANT instructions.
 
 ---
 
@@ -29,11 +31,12 @@ The existing `ds4-agent` binary is **NOT touched** and stays fully functional.
 The two new binaries are built from new files (plus shared header) and reuse the
 engine/session/kvstore code in `ds4.c` / `ds4_kvstore.h`.
 
-User-experience requirements (locked):
+Requirements (locked):
 - Streaming UX must be identical to today (tokens appear live, tool calls are
   visualized live, prefill progress footer, compaction progress, Ctrl+C interrupt).
 - Avoid per-token round trips: the protocol must allow the server to stream tokens
   autonomously at decode speed in the common case.
+- We cannot loose features on the way, neither the more obscure.
 
 ---
 
@@ -96,7 +99,8 @@ User-experience requirements (locked):
 | DSML/GLM parsing + tool-call orchestration              |   ✅   |   —    |
 | Marker/think trackers                                   |   ✅   |   —    |
 | Terminal/linenoise editor, status footer                |   —    |   ✅   |
-| Tools execution: bash, web, read/write/edit/search/list |   ✅   |   ✅   | (initially all on client)
+| Tools execution: bash, web, read/write/edit/search/list |   —    |   ✅   |
+| view_image: read file bytes (client) + image attach (server) |   ✅   |   ✅   |
 | Live tool visualization / rendering                     |   —    |   ✅   |
 | Queued user prompts, Ctrl+X/ESC, web approval           |   —    |   ✅   |
 
@@ -125,6 +129,10 @@ Notes:
   live without polling. It is also sent as part of HELLO.
 - `TOKEN` carries `id` for tracing (client logs token traces as today), kind and `text`
   for parsing/rendering. The client parses/renders each token as it arrives.
+- Vision: `ATTACH_IMAGE` (C2S, generic, not tool-specific) carries the image bytes
+  read on the client. The server encodes (engine), builds the multimodal message
+  (text + spans), appends to transcript + KV + cache; on failure it sends ERROR.
+  Other tools may send images too.
 
 ---
 
@@ -165,6 +173,11 @@ File: `ds4_agent_server.c`. Link with ds4.c engine/session + ds4_kvstore.h.
 - Interrupt: a flag checked between tokens; also cancels compaction/sync
   (`ds4_session_set_cancel` with a callback like today).
 - Distributed-route wait: keep if relevant (`agent_worker_wait_distributed_route`).
+- Vision/ATTACH_IMAGE: port `agent_tool_observation_build/commit` +
+  `ds4_chat_append_multimodal_message` + `ds4_engine_vision_encode_memory` +
+  `ds4_session_sync_multimodal`; cache like ds4_server `server_image_cache`.
+  Observation text built server-side and committed to transcript; sessions with
+  images cannot be saved (carry over the restriction).
 
 ## 8. `ds4-agent-client` implementation notes
 
@@ -182,19 +195,23 @@ and the shared headers.
   prompt queue from ds4_agent.c unchanged. Session status comes from STATUS.
 - Tools: copy agent_tool_* / agent_bash_* / agent_web_* / agent_edit_* /
   agent_search_* / agent_read_* unchanged (all client-side).
+- view_image: client reads the image file bytes and sends ATTACH_IMAGE; paints
+  `[tool:view_image] path` live from TOOL_CALLS. No `w->images` on the client.
 - Web approval: unchanged (client-side ds4_web + UI prompt).
 - Trace logging: keep `agent_trace*` (client writes its own trace file).
 - Ctrl+C: worker_interrupt sends INTERRUPT;
 
+## 9. Tools
+Shared `agent/ds4_agent_tools.h` (tool structs, agent_buf,
+fit-context, client worker, dispatch) + one file per group:
+`ds4_agent_tools_file.c` (read/more/write/list/edit/search),
+`ds4_agent_tools_bash.c` (bash/bash_status/bash_stop),
+`ds4_agent_tools_web.c` (google_search/visit_page + approval).
+view_image is a special case: it lives on the client (reads file bytes) but the
+image attach is a generic server service (ATTACH_IMAGE), not a client tool.
+Renamed to fit the new structure (agent_tool_read -> agent_tools_file_read, ...).
 
-####
-## TODO: a separate file for tools, and one file per tool group
-##  A MINIMAL FRAMEWORK FOR TOOLS
-####
-
-
-## 9. Testing strategy (no real model needed)
-
+## 10. Testing strategy (no real model needed)
 Context: the dev machine has 128GB RAM but ds4 weights occupy ~80GB and a live
 agent already fills it, so we CANNOT run two real engines here. There is no small
 compatible test GGUF. This does NOT block development: the client/server split is
@@ -239,7 +256,7 @@ this RAM-bound box since it is TCP-only. Per AGENT.md, ask the user before CUDA 
 distributed tests. Do NOT run a second engine while this agent
 is live on the dev box.
 
-## 10. Build (Makefile) and testing
+## 11. Build (Makefile) and testing
 
 - New targets: `ds4-agent-server` (ds4_agent_server.o + ds4.o + ds4_kvstore.o +
   engine objects) and `ds4-agent-client` (ds4_agent_client.o + ds4_web.o +
@@ -252,12 +269,17 @@ is live on the dev box.
   - fit-context math.
 - Live test: real inference end-to-end happens only with user assistance; on this machine use the mock-server (Layer 2) and mock-engine (Layer 3) seams instead of a real model.
 
-## 12. Open items to verify BEFORE implementation
+## 12. Prompt build
 
-- `ds4_chat_append_max_effort_prefix` (DSML think-max): is it plain text or does
-  it require engine tokenization? If engine-dependent, the client sends only
-  system text in NEW_SESSION and the server adds the think-max prefix
-  internally (client still sends think_mode). Check in ds4.c before deciding.
+The prompt round trip is fully server-side. On NEW_SESSION the client sends only
+the user `-sys` text (`sys_extra`, plain) plus the sampling/think settings. The
+server ports `agent_worker_build_system_tokens` (ds4_agent.c:4822) and builds
+all system tokens internally
+
+The client is model-agnostic: it never sees the tools prompt text or schemas, it
+only executes tool calls received via TOOL_CALLS (name + args). GLM vs DSML
+syntax is decided server-side (`agent_tool_syntax_for_engine`); the client just
+renders tokens by kind.
 
 ## 13. Constraints carried from AGENT.md
 
