@@ -10,7 +10,7 @@ When following this plan you commit at least once at very step, and you don't ne
 legend: [ ] todo  [>] in progress  [x] done
 
 - [x] 1. Protocol tests (Layer 1)
-- [ ] 2. Port DSML/GLM parser + marker/think trackers into ds4_agent_server.c
+- [>] 2. Port DSML/GLM parser + marker/think trackers into ds4_agent_server.c
 - [ ] 3. Server skeleton + mock engine seam (Layer 3)
 - [ ] 4. Tools framework (client-side): header + one file per group
 - [ ] 5. Client skeleton + mock-server harness (Layer 2)
@@ -32,6 +32,11 @@ the proto header note). Port from `ds4_agent.c` (`agent_stream_*`,
 `agent_dsml_parser`, tool-call orchestration, `agent_tool_viz`-style render
 kinds) and port the existing `test_agent_glm`/`test_agent_dsml` tests.
 Most delicate piece; do it early.
+
+DECISION (approved): drop the mid-generation edit-old preflight
+(`agent_preflight_edit_old` + `agent_stream_preflight_closed_param`). The
+server cannot read files (client-side). The client checks exact-old uniqueness
+at edit execution time instead. No new protocol message, no async pause.
 
 
 ## Task 3 — Server skeleton + mock engine seam (Layer 3)
