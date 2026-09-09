@@ -42,12 +42,12 @@ Requirements (locked):
 
 ## 2. Locked design decisions
 
-0. The goal is to split the current monolitic agent, without loosing a single
+1. The goal is to split the current monolitic agent, without loosing a single
    feature, without altering the user experinece and keeping the same code 
    style/conventions of the monolitic agent. Before inventing a solution look
    at how it is done in the monolitic agent.
 
-1. **No edit-upto.** Remove BOTH the `[upto]` marker and the forcer
+2. **No edit-upto.** Remove BOTH the `[upto]` marker and the forcer
    (`agent_edit_upto_forcer`, `agent_edit_old_*`, `[upto]` handling in
    `agent_edit_find_old_span`, the `--edit-upto` prompt variant).
    The edit tool becomes exact old/new matching only (`old` must match exactly
@@ -57,28 +57,28 @@ Requirements (locked):
    content + next-token text + pre-eval decision = a round trip per token).
    The current agent keeps it; the new client simply does not implement it.
 
-2. **Datetime and system-prompt reminders are server-side**, like the initial
+3. **Datetime and system-prompt reminders are server-side**, like the initial
    prompt. The server decides when to inject the datetime context and when to
    re-inject the system prompt reminder (every 50k transcript tokens). 
 
-3. **Server is the sole authority on the transcript.**, and the sole to parse
+4. **Server is the sole authority on the transcript.**, and the sole to parse
    render DSML, thinking. Client is model-agnostic, it just render markdown
    and the tokens in the correct format/color given the token kind.
 
-4. **Compaction is server-side.** the server builds the compaction prompt 
+5. **Compaction is server-side.** the server builds the compaction prompt 
    internally, runs generation (think-mode none, greedy, stop at control token), 
    streams the summary tokens to the client for display, rebuilds the compacted 
    transcript. Interrupt during compaction works (server checks interrupt between 
    tokens).
 
-9. **Sessions/persistence are server-side**: sysprompt.kv, saved sessions, titles,
+6. **Sessions/persistence are server-side**: sysprompt.kv, saved sessions, titles,
    `/save /switch /del /strip /list`.
 
-10. **One session per TCP connection.** On disconnect the server tears down the
+7. **One session per TCP connection.** On disconnect the server tears down the
     session and engine. No multi-client handoff (it is a local tool). The client
     opens the connection at startup and keeps it for the process lifetime.
 
-11. **Web approval and bash jobs are client-side** (they are tools). The browser
+8. **Web approval and bash jobs are client-side** (they are tools). The browser
     (ds4_web) and bash process groups never touch the server.
 
 
@@ -127,6 +127,9 @@ Notes:
 - `STATUS` is pushed by the server on every meaningful transition (state change,
   prefill progress, generated count, greedy toggle) so the client footer stays
   live without polling. It is also sent as part of HELLO.
+- `TURN_PAUSED` (S2C) is an **empty marker**: the server has parsed a complete
+  tool call (which already travelled on TOOL_CALLS) and pauses the turn waiting
+  for `TOOL_RESULT`. It carries no payload; use `proto_encode_empty`.
 - `TOKEN` carries `id` for tracing (client logs token traces as today), kind and `text`
   for parsing/rendering. The client parses/renders each token as it arrives.
 - Vision: `ATTACH_IMAGE` (C2S, generic, not tool-specific) carries the image bytes
@@ -136,15 +139,19 @@ Notes:
 
 ---
 
-## 6. Shared header `ds4_agent_proto.h` + `ds4_agent_utils.h`
+## 5. Shared header `ds4_agent_proto.h` + `ds4_agent_utils.h`
 
 Self-contained (no engine, no file I/O, no OS deps beyond malloc/string). 
 
 Both binaries include this headers.
 
+`agent_buf` (dynamic string buffer used by the server for prompt/title/persistence
+building and by the client for tool output) lives in `ds4_agent_utils.h`, shared
+by both binaries.
+
 ---
 
-## 7. `ds4-agent-server` implementation ideas
+## 6. `ds4-agent-server` implementation ideas
 
 File: `ds4_agent_server.c`. Link with ds4.c engine/session + ds4_kvstore.h.
 
@@ -154,7 +161,8 @@ File: `ds4_agent_server.c`. Link with ds4.c engine/session + ds4_kvstore.h.
   (default e.g. 9334) and `--host <addr>` (default e.g. 127.0.0.1).
 - Main loop: socket accept (single client), then read messages with the framing,
   dispatch to handlers, write framed replies.
-- Session lifecycle: create session on NEW_SESSION (ctx from message), load or
+- Session lifecycle: create session on NEW_SESSION using the server CLI `--ctx`
+  (ctx_size is NOT in the NEW_SESSION message; it is CLI-server only). Load or
   build sysprompt.kv from the received sysprompt text (server-side persistence
   logic copied from ds4_agent.c `agent_worker_reset_to_sysprompt` /
   `agent_kv_load_path` / `agent_kv_save_path`). On disconnect, `ds4_engine_close`.
@@ -189,15 +197,16 @@ File: `ds4_agent_server.c`. Link with ds4.c engine/session + ds4_kvstore.h.
   emitted as NORMAL kind for now; a dedicated STATUS token kind is a possible
   future refinement (protocol change, Layer 1).
 
-## 8. `ds4-agent-client` implementation notes
+## 7. `ds4-agent-client` implementation notes
 
 File: `ds4_agent_client.c`. Does NOT link the engine. Links linenoise, ds4_web,
 and the shared headers.
 
 - CLI: keep the UI options (prompt, non-interactive, raw, chdir, trace,
-  ctx, temp, top-p, min-p, think, edit-upto REMOVED, power, etc.) plus new
-  `--server <host:port>` (default localhost:9334). No model/backend options
-  (the server owns those).
+  temp, top-p, min-p, think, edit-upto REMOVED, power, etc.) plus new
+  `--server <host:port>` (default localhost:9334). No model/backend/ctx
+  options (the server owns those): `ctx_size` is NOT in NEW_SESSION, it comes
+  from the server CLI `--ctx`.
 - Transport: a small TCP client with the framing; a worker thread owns the socket
   and the tool excecution; the UI thread owns the editor (mirror the
   existing worker/UI split in ds4_agent.c).
@@ -211,9 +220,9 @@ and the shared headers.
 - Trace logging: keep `agent_trace*` (client writes its own trace file).
 - Ctrl+C: worker_interrupt sends INTERRUPT;
 
-## 9. Tools
-Shared `agent/ds4_agent_tools.h` (tool structs, agent_buf,
-fit-context, client worker, dispatch) + one file per group:
+## 8. Tools
+Shared `agent/ds4_agent_tools.h` (tool structs, fit-context, client worker,
+dispatch; `agent_buf` lives in shared `ds4_agent_utils.h`) + one file per group:
 `ds4_agent_tools_file.c` (read/more/write/list/edit/search),
 `ds4_agent_tools_bash.c` (bash/bash_status/bash_stop),
 `ds4_agent_tools_web.c` (google_search/visit_page + approval).
@@ -221,13 +230,13 @@ view_image is a special case: it lives on the client (reads file bytes) but the
 image attach is a generic server service (ATTACH_IMAGE), not a client tool.
 Renamed to fit the new structure (agent_tool_read -> agent_tools_file_read, ...).
 
-## 10. Testing strategy (no real model needed)
+## 9. Testing strategy (no real model needed)
 Context: the dev machine has 128GB RAM but ds4 weights occupy ~80GB and a live
 agent already fills it, so we CANNOT run two real engines here. There is no small
 compatible test GGUF. This does NOT block development: the client/server split is
 mostly control logic (protocol, state machines, UI, tools, persistence), and only
-the innermost inference layer needs a real model. We test by layers with mock
-seams; only the last layer requires a machine with RAM.
+the innermost inference layer needs a real model. We test by layers; only the
+last layer (real inference) requires a machine with RAM.
 
 ### Layer 1 — Protocol (pure unit test, no model)
 Encode/decode round trips for every message type, framing (4-byte length), varint
@@ -246,18 +255,15 @@ to the real client as the server and feeds scripted `TOKEN` / `TURN_PAUSED` /
   fake replies.
 This covers the whole UX + tool loop (the most fragile part) with zero model.
 
-### Layer 3 — Server logic against a MOCK ENGINE (test build only)
-The server calls `ds4_session_*` / `ds4_engine_*`. Add a small **backend seam**
-(function pointers: sample / eval / sync / argmax / tokenize / token_text) with two
-implementations:
-- real: wraps ds4 session/engine;
-- mock: deterministic, scripted output, compiled ONLY under `#ifdef DS4_AGENT_TEST`.
-Under the seam, test (with a mock tokenizer): message handling + framing, state,
-sysprompt.kv + session persistence (save/switch/del/strip/list), compaction
-(prompt, summary loop, transcript rebuild), sampling loop + TURN_PAUSED
-transitions, POWER, TOKENS, interrupt.
-The mock never ships in the production binary (respects AGENT.md: no variants
-behind flags — diagnostic test seams are fine).
+### Layer 3 — Server control logic
+DECISION (approved, after long discussion): we test the server like the monolithic
+agent does (we do not reinvent the wheel): include `ds4_agent_server.c` under
+`DS4_AGENT_TEST` and exercise the pure/control logic directly (protocol
+decode/dispatch, framing, persistence helpers, sysprompt.kv + session
+identity/title/listing helpers, compaction prompt builder, state transitions).
+The engine-dependent sampling/compaction/sync paths are NOT unit-tested here —
+they are validated only on a RAM/CUDA host (Layer 4), exactly like the monolith
+leaves the engine paths to live testing.
 
 ### Layer 4 — Real inference end-to-end (requires a host with RAM)
 Only when validating true prefill/sampling: run server + client on a machine with
@@ -266,7 +272,7 @@ this RAM-bound box since it is TCP-only. Per AGENT.md, ask the user before CUDA 
 distributed tests. Do NOT run a second engine while this agent
 is live on the dev box.
 
-## 11. Build (Makefile) and testing
+## 10. Build (Makefile) and testing
 
 - New targets: `ds4-agent-server` (ds4_agent_server.o + ds4.o + ds4_kvstore.o +
   engine objects) and `ds4-agent-client` (ds4_agent_client.o + ds4_web.o +
@@ -276,10 +282,13 @@ is live on the dev box.
   - shared parser/detector behavior (DSML + GLM chunked, think-tool ignored,
     greedy boundaries — port the existing test_agent_glm/dsml tests to the
     shared parser);
-  - fit-context math.
-- Live test: real inference end-to-end happens only with user assistance; on this machine use the mock-server (Layer 2) and mock-engine (Layer 3) seams instead of a real model.
+  - fit-context math;
+  - server control-logic tests (Layer 3): persistence helpers, sysprompt.kv +
+    session identity/title/listing helpers, compaction prompt builder, state
+    transitions, protocol decode/dispatch — same style as tests/ds4_agent_test.c.
+- Live test: real inference end-to-end happens only with user assistance; on this machine use the mock-server (Layer 2) harness instead of a real model. The server engine paths are not unit-tested here (see Layer 3 decision).
 
-## 12. Prompt build
+## 11. Prompt build
 
 The prompt round trip is fully server-side. On NEW_SESSION the client sends only
 the user `-sys` text (`sys_extra`, plain) plus the sampling/think settings. The
@@ -291,7 +300,7 @@ only executes tool calls received via TOOL_CALLS (name + args). GLM vs DSML
 syntax is decided server-side (`agent_tool_syntax_for_engine`); the client just
 renders tokens by kind.
 
-## 13. Constraints carried from AGENT.md
+## 12. Constraints carried from AGENT.md
 
 - No C++. Small, readable, elegant code. No dead code / slop.
 - Keep the production path whole-model Metal graph inference; do not disturb SSD

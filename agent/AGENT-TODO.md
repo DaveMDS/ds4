@@ -11,7 +11,7 @@ legend: [ ] todo  [>] in progress  [x] done
 
 - [x] 1. Protocol tests (Layer 1)
 - [x] 2. Port DSML/GLM parser + marker/think trackers into ds4_agent_server.c
-- [>] 3. Server skeleton + mock engine seam (Layer 3)
+- [>] 3. Server skeleton
 - [ ] 4. Tools framework (client-side): header + one file per group
 - [ ] 5. Client skeleton + mock-server harness (Layer 2)
 - [ ] 6. Makefile targets + build/test integration
@@ -39,16 +39,20 @@ server cannot read files (client-side). The client checks exact-old uniqueness
 at edit execution time instead. No new protocol message, no async pause.
 
 
-## Task 3 — Server skeleton + mock engine seam (Layer 3)
+## Task 3 — Server skeleton
 `ds4_agent_server.c`: CLI (`parse_options` minus UI/tool opts + `--port`/`--host`),
 socket accept (single client), framing read/dispatch, session lifecycle
 (NEW_SESSION), status push, HELLO, TOKEN, TURN_PAUSED, TOOL_CALLS,
 TOOL_RESULT/ATTACH_IMAGE, COMPACT, sessions/persistence (sysprompt.kv, save/
-switch/del/strip/list), POWER, TOKENS->COUNT, INTERRUPT. Backend seam (function
-pointers sample/eval/sync/argmax/tokenize/token_text) with a mock under
-`#ifdef DS4_AGENT_TEST`: test state, persistence, compaction, sampling loop +
-TURN_PAUSED, POWER, TOKENS, interrupt. Mock never ships (AGENT.md: no variants
-behind flags; diagnostic test seams fine).
+switch/del/strip/list), POWER, TOKENS->COUNT, INTERRUPT. `ctx_size` is NOT in
+the NEW_SESSION message: it is CLI-server only (`--ctx`). The engine-dependent
+sampling loop is written directly against the real `ds4_session_*` / `ds4_engine_*`
+API (like the monolithic agent): we do not reinvent the wheel for tests. Unit
+tests follow the monolith pattern: include `ds4_agent_server.c` under
+`DS4_AGENT_TEST` and test the pure/control logic directly (protocol
+decode/dispatch, persistence helpers, state, compaction prompt, titles/identity),
+same style as `tests/ds4_agent_test.c`. The real sampling/compaction/sync paths
+are validated only on a RAM/CUDA host (Layer 4).
 
 
 ## Task 4 — Tools framework (client-side)
