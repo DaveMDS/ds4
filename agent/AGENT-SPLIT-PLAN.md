@@ -178,6 +178,16 @@ File: `ds4_agent_server.c`. Link with ds4.c engine/session + ds4_kvstore.h.
   `ds4_session_sync_multimodal`; cache like ds4_server `server_image_cache`.
   Observation text built server-side and committed to transcript; sessions with
   images cannot be saved (carry over the restriction).
+- Render-directive producer (Task 2, `agent_render_sink` in ds4_agent_server.c):
+  the streaming parser no longer paints a terminal. It emits (kind, text)
+  fragments the client renders: NORMAL / THINK / TOOL_NAME / TOOL_PARAM_NAME /
+  TOOL_PARAM_VALUE. Adjacent same-kind fragments are coalesced. Terminal-only
+  painting (prefixes, cursor clears, diff "-/+", syntax highlighting) is
+  dropped; the read-tool semantic summary ("Reading <path> <start>:<max>...")
+  is kept because the client should paint it. Status messages ("[tool call
+  ignored: ...]", "[invalid tool call: ...]", "[tool call interrupted]") are
+  emitted as NORMAL kind for now; a dedicated STATUS token kind is a possible
+  future refinement (protocol change, Layer 1).
 
 ## 8. `ds4-agent-client` implementation notes
 

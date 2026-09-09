@@ -10,7 +10,7 @@ When following this plan you commit at least once at very step, and you don't ne
 legend: [ ] todo  [>] in progress  [x] done
 
 - [x] 1. Protocol tests (Layer 1)
-- [>] 2. Port DSML/GLM parser + marker/think trackers into ds4_agent_server.c
+- [x] 2. Port DSML/GLM parser + marker/think trackers into ds4_agent_server.c
 - [ ] 3. Server skeleton + mock engine seam (Layer 3)
 - [ ] 4. Tools framework (client-side): header + one file per group
 - [ ] 5. Client skeleton + mock-server harness (Layer 2)
