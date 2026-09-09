@@ -744,6 +744,10 @@ q4k-dot-test: tests/test_q4k_dot.c
 	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/test_q4k_dot tests/test_q4k_dot.c -lm -pthread
 	./tests/test_q4k_dot
 
+ds4_agent_proto_test: tests/ds4_agent_proto_test.c agent/ds4_agent_proto.h agent/ds4_agent_utils.h
+	$(CC) -O2 -Wall -Wextra -std=c99 -D_GNU_SOURCE -I. -o tests/ds4_agent_proto_test tests/ds4_agent_proto_test.c
+	./tests/ds4_agent_proto_test
+
 mxfp4-dot-test: tests/test_mxfp4_dot.c
 	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/test_mxfp4_dot tests/test_mxfp4_dot.c -lm
 	./tests/test_mxfp4_dot

@@ -784,4 +784,372 @@ static inline bool proto_decode_switch_done(const void *data, size_t len,
     return proto_reader_string(&r, &m->sha);
 }
 
+#ifdef DS4_AGENT_TEST
+static int proto_test_failures;
+
+static void proto_test_assert(bool cond, const char *expr, const char *file, int line) {
+    if (cond) return;
+    fprintf(stderr, "%s:%d: assertion failed: %s\n", file, line, expr);
+    proto_test_failures++;
+}
+
+#define PROTO_TEST_ASSERT(expr) proto_test_assert((expr), #expr, __FILE__, __LINE__)
+
+static void proto_test_varint(void) {
+    const uint64_t vals[] = {
+        0, 1, 127, 128, 255, 16384, 2097152, 268435455,
+        0x7fffffffffffffffULL, 0xffffffffffffffffULL,
+    };
+    for (size_t i = 0; i < sizeof(vals) / sizeof(vals[0]); i++) {
+        proto_writer w;
+        proto_writer_init(&w);
+        proto_writer_varint(&w, vals[i]);
+        proto_reader r;
+        proto_reader_init(&r, w.buf, w.len);
+        uint64_t v = 0;
+        PROTO_TEST_ASSERT(proto_reader_varint(&r, &v));
+        PROTO_TEST_ASSERT(v == vals[i]);
+        PROTO_TEST_ASSERT(r.p == r.end);
+        proto_writer_free(&w);
+    }
+}
+
+static void proto_test_framing(void) {
+    proto_writer w;
+    size_t out;
+    unsigned char *f = proto_encode_empty(&w, PROTO_C2S_INTERRUPT, &out);
+    PROTO_TEST_ASSERT(out == 5);
+    uint32_t plen = ((uint32_t)f[0] << 24) | ((uint32_t)f[1] << 16) |
+                    ((uint32_t)f[2] << 8) | (uint32_t)f[3];
+    PROTO_TEST_ASSERT(plen == 1);
+    unsigned char tag = 0;
+    proto_reader payload;
+    PROTO_TEST_ASSERT(proto_open_frame(f, out, &payload, &tag));
+    PROTO_TEST_ASSERT(tag == PROTO_C2S_INTERRUPT);
+    PROTO_TEST_ASSERT(payload.p == payload.end);
+    PROTO_TEST_ASSERT(!proto_open_frame(f, out - 1, &payload, &tag));
+    proto_writer_free(&w);
+    free(f);
+}
+
+static void proto_test_generic(void) {
+    proto_writer w;
+    size_t out;
+    unsigned char *f = proto_encode_empty(&w, PROTO_C2S_COMPACT, &out);
+    unsigned char tag = 0;
+    PROTO_TEST_ASSERT(proto_decode_empty(f, out, PROTO_C2S_COMPACT, &tag));
+    PROTO_TEST_ASSERT(tag == PROTO_C2S_COMPACT);
+    free(f);
+    f = proto_encode_string(&w, PROTO_C2S_USER, "hello world", &out);
+    char *s = NULL;
+    PROTO_TEST_ASSERT(proto_decode_string(f, out, PROTO_C2S_USER, &tag, &s));
+    PROTO_TEST_ASSERT(s && !strcmp(s, "hello world"));
+    free(s);
+    proto_writer_free(&w);
+    free(f);
+    f = proto_encode_string(&w, PROTO_C2S_USER, "", &out);
+    PROTO_TEST_ASSERT(proto_decode_string(f, out, PROTO_C2S_USER, &tag, &s));
+    PROTO_TEST_ASSERT(s && s[0] == '\0');
+    free(s);
+    proto_writer_free(&w);
+    free(f);
+    f = proto_encode_varint(&w, PROTO_C2S_POWER, 42, &out);
+    uint64_t v = 0;
+    PROTO_TEST_ASSERT(proto_decode_varint(f, out, PROTO_C2S_POWER, &tag, &v));
+    PROTO_TEST_ASSERT(v == 42);
+    proto_writer_free(&w);
+    free(f);
+}
+
+static void proto_test_new_session(void) {
+    proto_new_session_msg m = {0};
+    m.sys_extra = xstrdup("-sys text");
+    m.n_predict = 512;
+    m.temperature = 0.8f;
+    m.top_p = 0.95f;
+    m.min_p = 0.05f;
+    m.think_mode = 1;
+    m.seed = 12345;
+    m.power = 3;
+    proto_writer w;
+    size_t out;
+    unsigned char *f = proto_encode_new_session(&w, &m, &out);
+    unsigned char tag = 0;
+    proto_new_session_msg d = {0};
+    PROTO_TEST_ASSERT(proto_decode_new_session(f, out, &tag, &d));
+    PROTO_TEST_ASSERT(tag == PROTO_C2S_NEW_SESSION);
+    PROTO_TEST_ASSERT(d.sys_extra && !strcmp(d.sys_extra, "-sys text"));
+    PROTO_TEST_ASSERT(d.n_predict == 512);
+    PROTO_TEST_ASSERT(d.temperature == 0.8f);
+    PROTO_TEST_ASSERT(d.top_p == 0.95f);
+    PROTO_TEST_ASSERT(d.min_p == 0.05f);
+    PROTO_TEST_ASSERT(d.think_mode == 1);
+    PROTO_TEST_ASSERT(d.seed == 12345);
+    PROTO_TEST_ASSERT(d.power == 3);
+    free(d.sys_extra);
+    free(m.sys_extra);
+    proto_writer_free(&w);
+    free(f);
+}
+
+static void proto_test_token(void) {
+    proto_token_msg m = {0};
+    m.id = 999;
+    m.kind = PROTO_TOKEN_TOOL_PARAM_VALUE;
+    m.text = xstrdup("abc");
+    proto_writer w;
+    size_t out;
+    unsigned char *f = proto_encode_token(&w, &m, &out);
+    unsigned char tag = 0;
+    proto_token_msg d = {0};
+    PROTO_TEST_ASSERT(proto_decode_token(f, out, &tag, &d));
+    PROTO_TEST_ASSERT(tag == PROTO_S2C_TOKEN);
+    PROTO_TEST_ASSERT(d.id == 999);
+    PROTO_TEST_ASSERT(d.kind == PROTO_TOKEN_TOOL_PARAM_VALUE);
+    PROTO_TEST_ASSERT(d.text && !strcmp(d.text, "abc"));
+    free(d.text);
+    free(m.text);
+    proto_writer_free(&w);
+    free(f);
+}
+
+static void proto_test_tool_calls(void) {
+    proto_tool_calls calls = {0};
+    proto_tool_call c = {0};
+    c.name = xstrdup("bash");
+    proto_tool_call_add_arg(&c, "command", "ls -la", strlen("ls -la"), true);
+    proto_tool_call_add_arg(&c, "timeout_sec", "60", 2, false);
+    proto_tool_calls_push(&calls, &c);
+    proto_writer w;
+    size_t out;
+    unsigned char *f = proto_encode_tool_calls(&w, &calls, &out);
+    unsigned char tag = 0;
+    proto_tool_calls d = {0};
+    PROTO_TEST_ASSERT(proto_decode_tool_calls(f, out, &tag, &d));
+    PROTO_TEST_ASSERT(tag == PROTO_S2C_TOOL_CALLS);
+    PROTO_TEST_ASSERT(d.len == 1);
+    PROTO_TEST_ASSERT(d.v[0].name && !strcmp(d.v[0].name, "bash"));
+    PROTO_TEST_ASSERT(d.v[0].argc == 2);
+    PROTO_TEST_ASSERT(d.v[0].args[0].name && !strcmp(d.v[0].args[0].name, "command"));
+    PROTO_TEST_ASSERT(d.v[0].args[0].value && !strcmp(d.v[0].args[0].value, "ls -la"));
+    PROTO_TEST_ASSERT(d.v[0].args[0].is_string);
+    PROTO_TEST_ASSERT(!d.v[0].args[1].is_string);
+    proto_tool_calls_free(&d);
+    proto_tool_calls_free(&calls);
+    proto_writer_free(&w);
+    free(f);
+}
+
+static void proto_test_status(void) {
+    proto_status_msg m = {0};
+    m.state = AGENT_GENERATING;
+    m.ctx_used = 1000;
+    m.ctx_size = 8192;
+    m.prefill_done = 500;
+    m.prefill_total = 1000;
+    m.prefill_tps = 123.5f;
+    m.generated = 42;
+    m.gen_tps = 55.0f;
+    m.greedy = true;
+    m.power = 2;
+    m.error = xstrdup("err");
+    proto_writer w;
+    size_t out;
+    unsigned char *f = proto_encode_status(&w, &m, &out);
+    unsigned char tag = 0;
+    proto_status_msg d = {0};
+    PROTO_TEST_ASSERT(proto_decode_status(f, out, &tag, &d));
+    PROTO_TEST_ASSERT(tag == PROTO_S2C_STATUS);
+    PROTO_TEST_ASSERT(d.state == AGENT_GENERATING);
+    PROTO_TEST_ASSERT(d.ctx_used == 1000);
+    PROTO_TEST_ASSERT(d.ctx_size == 8192);
+    PROTO_TEST_ASSERT(d.prefill_done == 500);
+    PROTO_TEST_ASSERT(d.prefill_total == 1000);
+    PROTO_TEST_ASSERT(d.prefill_tps == 123.5f);
+    PROTO_TEST_ASSERT(d.generated == 42);
+    PROTO_TEST_ASSERT(d.gen_tps == 55.0f);
+    PROTO_TEST_ASSERT(d.greedy);
+    PROTO_TEST_ASSERT(d.power == 2);
+    PROTO_TEST_ASSERT(d.error && !strcmp(d.error, "err"));
+    free(d.error);
+    free(m.error);
+    proto_writer_free(&w);
+    free(f);
+}
+
+static void proto_test_hello(void) {
+    proto_hello_msg m = {0};
+    m.session_title = xstrdup("My Session");
+    m.session_created_at = 1234567890;
+    m.status.state = AGENT_IDLE;
+    m.status.ctx_used = 10;
+    m.status.ctx_size = 8192;
+    m.status.prefill_done = 0;
+    m.status.prefill_total = 0;
+    m.status.prefill_tps = 0.0f;
+    m.status.generated = 0;
+    m.status.gen_tps = 0.0f;
+    m.status.greedy = false;
+    m.status.power = 0;
+    m.status.error = xstrdup("");
+    proto_writer w;
+    size_t out;
+    unsigned char *f = proto_encode_hello(&w, &m, &out);
+    unsigned char tag = 0;
+    proto_hello_msg d = {0};
+    PROTO_TEST_ASSERT(proto_decode_hello(f, out, &tag, &d));
+    PROTO_TEST_ASSERT(tag == PROTO_S2C_HELLO);
+    PROTO_TEST_ASSERT(d.session_title && !strcmp(d.session_title, "My Session"));
+    PROTO_TEST_ASSERT(d.session_created_at == 1234567890);
+    PROTO_TEST_ASSERT(d.status.state == AGENT_IDLE);
+    PROTO_TEST_ASSERT(d.status.ctx_used == 10);
+    free(d.session_title);
+    free(d.status.error);
+    free(m.session_title);
+    free(m.status.error);
+    proto_writer_free(&w);
+    free(f);
+}
+
+static void proto_test_save_done(void) {
+    proto_save_done_msg m = {0};
+    m.sha = xstrdup("0123456789abcdef0123456789abcdef01234567");
+    m.tokens = 1234;
+    proto_writer w;
+    size_t out;
+    unsigned char *f = proto_encode_save_done(&w, &m, &out);
+    unsigned char tag = 0;
+    proto_save_done_msg d = {0};
+    PROTO_TEST_ASSERT(proto_decode_save_done(f, out, &tag, &d));
+    PROTO_TEST_ASSERT(tag == PROTO_S2C_SAVE_DONE);
+    PROTO_TEST_ASSERT(d.sha && !strcmp(d.sha, m.sha));
+    PROTO_TEST_ASSERT(d.tokens == 1234);
+    free(d.sha);
+    free(m.sha);
+    proto_writer_free(&w);
+    free(f);
+}
+
+static void proto_test_list(void) {
+    proto_list_item it = {0};
+    strcpy(it.sha, "0123456789abcdef0123456789abcdef01234567");
+    it.title = xstrdup("Title");
+    it.last_used = 100;
+    it.created_at = 200;
+    it.tokens = 300;
+    it.file_size = 400;
+    it.payload_bytes = 500;
+    proto_list_msg m = {0};
+    m.count = 1;
+    m.cap = 1;
+    m.items = &it;
+    proto_writer w;
+    size_t out;
+    unsigned char *f = proto_encode_list(&w, &m, &out);
+    unsigned char tag = 0;
+    proto_list_msg d = {0};
+    PROTO_TEST_ASSERT(proto_decode_list(f, out, &tag, &d));
+    PROTO_TEST_ASSERT(tag == PROTO_S2C_LIST);
+    PROTO_TEST_ASSERT(d.count == 1);
+    PROTO_TEST_ASSERT(!strcmp(d.items[0].sha, it.sha));
+    PROTO_TEST_ASSERT(d.items[0].title && !strcmp(d.items[0].title, "Title"));
+    PROTO_TEST_ASSERT(d.items[0].last_used == 100);
+    PROTO_TEST_ASSERT(d.items[0].created_at == 200);
+    PROTO_TEST_ASSERT(d.items[0].tokens == 300);
+    PROTO_TEST_ASSERT(d.items[0].file_size == 400);
+    PROTO_TEST_ASSERT(d.items[0].payload_bytes == 500);
+    proto_list_msg_free(&d);
+    proto_writer_free(&w);
+    free(f);
+    free(it.title);
+}
+
+static void proto_test_switch_done(void) {
+    proto_switch_done_msg m = {0};
+    m.sha = xstrdup("sha123");
+    proto_writer w;
+    size_t out;
+    unsigned char *f = proto_encode_switch_done(&w, &m, &out);
+    unsigned char tag = 0;
+    proto_switch_done_msg d = {0};
+    PROTO_TEST_ASSERT(proto_decode_switch_done(f, out, &tag, &d));
+    PROTO_TEST_ASSERT(tag == PROTO_S2C_SWITCH_DONE);
+    PROTO_TEST_ASSERT(d.sha && !strcmp(d.sha, "sha123"));
+    free(d.sha);
+    free(m.sha);
+    proto_writer_free(&w);
+    free(f);
+}
+
+static void proto_test_attach_image(void) {
+    const unsigned char bytes[] = {0x89, 0x50, 0x4e, 0x47, 0x00, 0xff, 0x00, 0x7f};
+    proto_attach_image_msg m = {0};
+    m.data = xmalloc(sizeof(bytes));
+    memcpy(m.data, bytes, sizeof(bytes));
+    m.data_len = sizeof(bytes);
+    proto_writer w;
+    size_t out;
+    unsigned char *f = proto_encode_attach_image(&w, &m, &out);
+    unsigned char tag = 0;
+    proto_attach_image_msg d = {0};
+    PROTO_TEST_ASSERT(proto_decode_attach_image(f, out, &tag, &d));
+    PROTO_TEST_ASSERT(tag == PROTO_C2S_ATTACH_IMAGE);
+    PROTO_TEST_ASSERT(d.data_len == sizeof(bytes));
+    PROTO_TEST_ASSERT(d.data && memcmp(d.data, bytes, sizeof(bytes)) == 0);
+    free(d.data);
+    free(m.data);
+    proto_writer_free(&w);
+    free(f);
+    proto_attach_image_msg z = {0};
+    f = proto_encode_attach_image(&w, &z, &out);
+    proto_attach_image_msg dz = {0};
+    PROTO_TEST_ASSERT(proto_decode_attach_image(f, out, &tag, &dz));
+    PROTO_TEST_ASSERT(dz.data_len == 0);
+    proto_writer_free(&w);
+    free(f);
+}
+
+static void proto_test_malformed(void) {
+    proto_writer w;
+    size_t out;
+    unsigned char *f = proto_encode_string(&w, PROTO_C2S_USER, "x", &out);
+    unsigned char tag = 0;
+    char *s = NULL;
+    PROTO_TEST_ASSERT(!proto_decode_string(f, out, PROTO_C2S_TOKENS, &tag, &s));
+    proto_writer_free(&w);
+    free(f);
+    f = proto_encode_string(&w, PROTO_C2S_USER, "hello", &out);
+    PROTO_TEST_ASSERT(!proto_decode_string(f, out - 3, PROTO_C2S_USER, &tag, &s));
+    proto_writer_free(&w);
+    free(f);
+    f = proto_encode_empty(&w, PROTO_C2S_COMPACT, &out);
+    unsigned char payload;
+    proto_reader r;
+    PROTO_TEST_ASSERT(!proto_open_frame(f, 3, &r, &payload));
+    proto_writer_free(&w);
+    free(f);
+}
+
+static void proto_test_run_all(void) {
+    proto_test_varint();
+    proto_test_framing();
+    proto_test_generic();
+    proto_test_new_session();
+    proto_test_token();
+    proto_test_tool_calls();
+    proto_test_status();
+    proto_test_hello();
+    proto_test_save_done();
+    proto_test_list();
+    proto_test_switch_done();
+    proto_test_attach_image();
+    proto_test_malformed();
+    if (proto_test_failures) {
+        fprintf(stderr, "ds4_agent_proto_test: %d failure(s)\n", proto_test_failures);
+        exit(1);
+    }
+    printf("ds4_agent_proto_test: all ok\n");
+}
+#endif /* DS4_AGENT_TEST */
+
 #endif /* DS4_AGENT_PROTO_H */

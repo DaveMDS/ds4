@@ -9,7 +9,7 @@ When following this plan you commit at least once at very step, and you don't ne
 ## Plan progress
 legend: [ ] todo  [>] in progress  [x] done
 
-- [ ] 1. Protocol tests (Layer 1)
+- [x] 1. Protocol tests (Layer 1)
 - [ ] 2. Port DSML/GLM parser + marker/think trackers into ds4_agent_server.c
 - [ ] 3. Server skeleton + mock engine seam (Layer 3)
 - [ ] 4. Tools framework (client-side): header + one file per group
