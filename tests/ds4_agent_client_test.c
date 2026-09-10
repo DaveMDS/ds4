@@ -303,12 +303,140 @@ static void test_parse_server_endpoint(void) {
     CHECK(c3.n_predict == 1234);
 }
 
+/* ---- T9: render stack + client_apply_stream_fragment ------------------ */
+
+static char g_cap[65536];
+static size_t g_cap_len;
+static void cap_sink(const char *s, size_t n) {
+    if (g_cap_len + n < sizeof(g_cap)) {
+        memcpy(g_cap + g_cap_len, s, n);
+        g_cap_len += n;
+        g_cap[g_cap_len] = '\0';
+    }
+}
+
+static void render_reset(agent_token_renderer *r, agent_stream_renderer *sr,
+                         bool color) {
+    g_cap_len = 0;
+    g_cap[0] = '\0';
+    g_render_sink = cap_sink;
+    memset(r, 0, sizeof(*r));
+    r->format_thinking = true;
+    r->format_markdown = color;
+    r->use_color = color;
+    r->last_output_newline = true;
+    client_stream_renderer_init(sr, r, 100000);
+}
+
+static void frag(agent_stream_renderer *sr, uint32_t kind, const char *t) {
+    client_apply_stream_fragment(sr, kind, t, strlen(t));
+}
+
+static void test_render_normal_and_think(void) {
+    agent_token_renderer r;
+    agent_stream_renderer sr;
+    render_reset(&r, &sr, false); /* colour off -> markdown literals pass through */
+
+    frag(&sr, AGENT_STREAM_THINK, "planning the fix");
+    frag(&sr, AGENT_STREAM_NORMAL, "Here is the answer.");
+    client_stream_renderer_finish(&sr);
+
+    CHECK(strstr(g_cap, "planning the fix") != NULL);
+    CHECK(strstr(g_cap, "Here is the answer.") != NULL);
+    /* no raw think tags ever */
+    CHECK(strstr(g_cap, "<think>") == NULL);
+}
+
+static void test_render_system_notice(void) {
+    agent_token_renderer r;
+    agent_stream_renderer sr;
+    render_reset(&r, &sr, false);
+    frag(&sr, AGENT_STREAM_SYSTEM, "Updating system prompt cache");
+    CHECK(strstr(g_cap, "\xe2\x9c\xa6 Updating system prompt cache") != NULL);
+}
+
+static void test_render_tool_read_viz(void) {
+    agent_token_renderer r;
+    agent_stream_renderer sr;
+    render_reset(&r, &sr, false);
+
+    frag(&sr, AGENT_STREAM_TOOL_NAME, "read");
+    frag(&sr, AGENT_STREAM_TOOL_PARAM_NAME, "path");
+    frag(&sr, AGENT_STREAM_TOOL_PARAM_VALUE, "src/");
+    frag(&sr, AGENT_STREAM_TOOL_PARAM_VALUE, "foo.c");
+    frag(&sr, AGENT_STREAM_TOOL_PARAM_NAME, "max_lines");
+    frag(&sr, AGENT_STREAM_TOOL_PARAM_VALUE, "80");
+    /* a NORMAL fragment (the assistant's next text) closes the tool viz */
+    frag(&sr, AGENT_STREAM_NORMAL, "done.");
+    client_stream_renderer_finish(&sr);
+
+    CHECK(strstr(g_cap, "Reading ") != NULL);
+    CHECK(strstr(g_cap, "src/foo.c") != NULL);
+    CHECK(strstr(g_cap, ":80") != NULL);   /* the requested max_lines */
+    CHECK(strstr(g_cap, "done.") != NULL);
+}
+
+static void test_render_tool_edit_diff(void) {
+    agent_token_renderer r;
+    agent_stream_renderer sr;
+    render_reset(&r, &sr, false);
+
+    frag(&sr, AGENT_STREAM_TOOL_NAME, "edit");
+    frag(&sr, AGENT_STREAM_TOOL_PARAM_NAME, "path");
+    frag(&sr, AGENT_STREAM_TOOL_PARAM_VALUE, "a.c");
+    frag(&sr, AGENT_STREAM_TOOL_PARAM_NAME, "old");
+    frag(&sr, AGENT_STREAM_TOOL_PARAM_VALUE, "int x = 1;\n");
+    frag(&sr, AGENT_STREAM_TOOL_PARAM_NAME, "new");
+    frag(&sr, AGENT_STREAM_TOOL_PARAM_VALUE, "int x = 2;\n");
+    frag(&sr, AGENT_STREAM_NORMAL, "ok");
+    client_stream_renderer_finish(&sr);
+
+    CHECK(strstr(g_cap, "edit ") != NULL);
+    CHECK(strstr(g_cap, "a.c") != NULL);
+    CHECK(strstr(g_cap, "- int x = 1;") != NULL); /* diff-old prefix */
+    CHECK(strstr(g_cap, "+ int x = 2;") != NULL); /* diff-new prefix */
+}
+
+static void test_build_status_text(void) {
+    ap_status w = {0};
+    w.state = AGENT_STATE_GENERATING;
+    w.generated = 128;
+    w.gen_tps = ap_centi_from_double(24.5);
+    w.ctx_used = 12000;
+    w.ctx_size = 100000;
+    w.power_percent = 100;
+    agent_status st;
+    client_status_from_wire(&w, &st);
+
+    char buf[512];
+    build_status_text(&st, buf, sizeof(buf));
+    CHECK(strstr(buf, "ctx 12k/100k") != NULL);
+    CHECK(strstr(buf, "generation 128 tokens") != NULL);
+    CHECK(strstr(buf, "24.5 t/s") != NULL);
+
+    w.state = AGENT_STATE_IDLE;
+    client_status_from_wire(&w, &st);
+    build_status_text(&st, buf, sizeof(buf));
+    CHECK(strstr(buf, "| idle") != NULL);
+
+    w.state = AGENT_STATE_PREFILL;
+    w.prefill_done = 50; w.prefill_total = 200;
+    client_status_from_wire(&w, &st);
+    build_status_text(&st, buf, sizeof(buf));
+    CHECK(strstr(buf, "50/200") != NULL && strstr(buf, "25.0%") != NULL);
+}
+
 int main(void) {
     test_handshake_new_session();
     test_handshake_resume();
     test_handshake_resume_falls_back_to_new();
     test_handshake_version_mismatch();
     test_parse_server_endpoint();
+    test_render_normal_and_think();
+    test_render_system_notice();
+    test_render_tool_read_viz();
+    test_render_tool_edit_diff();
+    test_build_status_text();
 
     if (failures) {
         fprintf(stderr, "%d agent client test(s) failed\n", failures);
