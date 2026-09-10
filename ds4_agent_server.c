@@ -20,6 +20,7 @@
 #include "ds4_gpu_args.h"
 #include "ds4_kvstore.h"
 #include "ds4_prompt_prefix.h"
+#include "ds4_tool_text.h"
 #include "ds4_agent_proto.h"
 #include "ds4_agent_utils.h"
 
@@ -2203,6 +2204,1080 @@ static void agent_worker_free(agent_worker *w) {
     free(w->out);
     pthread_cond_destroy(&w->cond);
     pthread_mutex_destroy(&w->mu);
+}
+
+
+/* ========================================================================= */
+/* Streaming classifier: DSML/GLM parser + (kind, text) fragment emitter.      */
+/*                                                                            */
+/* The parser cluster (agent_dsml_* / agent_glm_tool_parse / agent_tool_call*)*/
+/* is copied verbatim from ds4_agent.c. The painting layer is NOT: instead of */
+/* driving agent_token_renderer / agent_tool_viz_*, the control flow feeds     */
+/* srv_emit(kind, bytes), coalescing adjacent same-kind fragments. The client */
+/* (T9) rebuilds the terminal projection from the (kind, text) stream. See    */
+/* AGENT-SPLIT-PLAN.md "Rendering split". TOOL_CALLS emission and the turn     */
+/* loop are T6.                                                                */
+/* ========================================================================= */
+
+typedef struct {
+    char *name;
+    char *value;
+    bool is_string;
+} agent_tool_arg;
+
+typedef struct {
+    char *name;
+    agent_tool_arg *args;
+    int argc;
+    int argcap;
+} agent_tool_call;
+
+typedef struct {
+    agent_tool_call *v;
+    int len;
+    int cap;
+} agent_tool_calls;
+
+typedef enum {
+    AGENT_DSML_SEARCH,
+    AGENT_DSML_STRUCTURAL,
+    AGENT_DSML_PARAM_VALUE,
+    AGENT_DSML_DONE,
+    AGENT_DSML_ERROR,
+} agent_dsml_state;
+
+typedef struct {
+    agent_tool_syntax syntax;
+    agent_dsml_state state;
+    char search_tail[64];
+    size_t search_len;
+    char *raw;
+    size_t raw_len;
+    size_t raw_cap;
+    size_t parse_pos;
+    agent_tool_call current;
+    char *param_name;
+    bool param_is_string;
+    size_t param_value_start;
+    bool param_close_prefix;
+    bool glm_after_call;
+    agent_tool_calls calls;
+    char error[160];
+} agent_dsml_parser;
+
+typedef struct {
+    char tail[32];
+    size_t len;
+} agent_dsml_marker_detector;
+
+static bool bytes_has_prefix(const char *p, size_t n, const char *prefix) {
+    size_t plen = strlen(prefix);
+    return n >= plen && memcmp(p, prefix, plen) == 0;
+}
+
+static bool bytes_is_partial_prefix(const char *p, size_t n, const char *prefix) {
+    size_t plen = strlen(prefix);
+    return n < plen && memcmp(prefix, p, n) == 0;
+}
+
+static void agent_tool_call_free(agent_tool_call *c) {
+    if (!c) return;
+    free(c->name);
+    for (int i = 0; i < c->argc; i++) {
+        free(c->args[i].name);
+        free(c->args[i].value);
+    }
+    free(c->args);
+    memset(c, 0, sizeof(*c));
+}
+
+static void agent_tool_calls_free(agent_tool_calls *calls) {
+    if (!calls) return;
+    for (int i = 0; i < calls->len; i++) agent_tool_call_free(&calls->v[i]);
+    free(calls->v);
+    memset(calls, 0, sizeof(*calls));
+}
+
+static void agent_tool_call_add_arg(agent_tool_call *c, const char *name,
+                                    const char *value, size_t value_len,
+                                    bool is_string, const char *end_tag) {
+    if (c->argc == c->argcap) {
+        c->argcap = c->argcap ? c->argcap * 2 : 4;
+        c->args = xrealloc(c->args, (size_t)c->argcap * sizeof(c->args[0]));
+    }
+    c->args[c->argc++] = (agent_tool_arg){
+        .name = xstrdup(name),
+        .value = xstrndup(value, value_len),
+        .is_string = is_string,
+    };
+    if (is_string) ds4_tool_text_unescape(c->args[c->argc - 1].value, end_tag);
+}
+
+static void agent_tool_calls_push(agent_tool_calls *calls, agent_tool_call *call) {
+    if (!call->name) return;
+    if (calls->len == calls->cap) {
+        calls->cap = calls->cap ? calls->cap * 2 : 2;
+        calls->v = xrealloc(calls->v, (size_t)calls->cap * sizeof(calls->v[0]));
+    }
+    calls->v[calls->len++] = *call;
+    memset(call, 0, sizeof(*call));
+}
+
+static const char *agent_tool_arg_value(const agent_tool_call *call, const char *name) {
+    for (int i = 0; i < call->argc; i++) {
+        if (call->args[i].name && !strcmp(call->args[i].name, name))
+            return call->args[i].value ? call->args[i].value : "";
+    }
+    return NULL;
+}
+
+static void agent_dsml_parser_free(agent_dsml_parser *p) {
+    if (!p) return;
+    agent_tool_syntax syntax = p->syntax;
+    free(p->raw);
+    agent_tool_call_free(&p->current);
+    free(p->param_name);
+    agent_tool_calls_free(&p->calls);
+    memset(p, 0, sizeof(*p));
+    p->syntax = syntax;
+}
+
+static void agent_dsml_parser_reset(agent_dsml_parser *p) {
+    agent_dsml_parser_free(p);
+    p->state = AGENT_DSML_SEARCH;
+}
+
+static void agent_dsml_raw_append(agent_dsml_parser *p, const char *s, size_t n) {
+    if (!n) return;
+    if (p->raw_len + n + 1 > p->raw_cap) {
+        size_t cap = p->raw_cap ? p->raw_cap * 2 : 512;
+        while (cap < p->raw_len + n + 1) cap *= 2;
+        p->raw = xrealloc(p->raw, cap);
+        p->raw_cap = cap;
+    }
+    memcpy(p->raw + p->raw_len, s, n);
+    p->raw_len += n;
+    p->raw[p->raw_len] = '\0';
+}
+
+static char *agent_parse_attr(const char *tag, const char *name) {
+    char pat[64];
+    snprintf(pat, sizeof(pat), "%s=\"", name);
+    const char *p = strstr(tag, pat);
+    if (!p) return NULL;
+    p += strlen(pat);
+    const char *end = strchr(p, '"');
+    if (!end) return NULL;
+    return xstrndup(p, (size_t)(end - p));
+}
+
+static void agent_dsml_set_error(agent_dsml_parser *p, const char *msg) {
+    p->state = AGENT_DSML_ERROR;
+    snprintf(p->error, sizeof(p->error), "%s", msg);
+}
+
+static const char *agent_skip_ascii_space(const char *p, const char *end) {
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+    return p;
+}
+
+static void agent_trim_span(const char **p, const char **end) {
+    *p = agent_skip_ascii_space(*p, *end);
+    while (*end > *p) {
+        char c = (*end)[-1];
+        if (c != ' ' && c != '\t' && c != '\r' && c != '\n') break;
+        (*end)--;
+    }
+}
+
+static bool agent_dsml_open_tag_is(const char *tag, const char *name) {
+    char prefix[64];
+    snprintf(prefix, sizeof(prefix), "<｜DSML｜%s", name);
+    size_t prefix_len = strlen(prefix);
+    if (strncmp(tag, prefix, prefix_len) != 0) return false;
+    char c = tag[prefix_len];
+    return c == '>' || c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+static bool agent_dsml_close_tag_at(const char *s, const char *name, size_t *tag_len) {
+    char prefix[64];
+    static const char dsml_bar[] = "｜";
+    snprintf(prefix, sizeof(prefix), "</｜DSML｜%s", name);
+    size_t prefix_len = strlen(prefix);
+    if (strncmp(s, prefix, prefix_len) != 0) return false;
+    const char *p = s + prefix_len;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (strncmp(p, dsml_bar, strlen(dsml_bar)) == 0) p += strlen(dsml_bar);
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p != '>') return false;
+    if (tag_len) *tag_len = (size_t)(p - s) + 1;
+    return true;
+}
+
+/* Recognize a streamed parameter close tag prefix.  Full close detection is
+ * handled by agent_dsml_close_tag_at(); this helper exists for online behavior:
+ * terminal rendering must hide partial close tags without waiting for the whole
+ * parameter to finish. */
+static bool agent_dsml_parameter_close_tail(const char *tail, size_t len,
+                                            bool *complete) {
+    static const char prefix[] = "</｜DSML｜parameter";
+    static const char dsml_bar[] = "｜";
+    const size_t prefix_len = sizeof(prefix) - 1;
+    const size_t bar_len = sizeof(dsml_bar) - 1;
+    *complete = false;
+    if (len <= prefix_len) return memcmp(prefix, tail, len) == 0;
+    if (memcmp(prefix, tail, prefix_len) != 0) return false;
+    size_t i = prefix_len;
+    while (i < len && (tail[i] == ' ' || tail[i] == '\t' ||
+                       tail[i] == '\r' || tail[i] == '\n')) i++;
+    if (i < len && len - i <= bar_len) {
+        if (memcmp(dsml_bar, tail + i, len - i) == 0) return true;
+    }
+    if (i + bar_len <= len && memcmp(tail + i, dsml_bar, bar_len) == 0)
+        i += bar_len;
+    for (; i < len; i++) {
+        if (tail[i] == '>') {
+            *complete = i == len - 1;
+            return *complete;
+        }
+        if (tail[i] != ' ' && tail[i] != '\t' && tail[i] != '\r' && tail[i] != '\n')
+            return false;
+    }
+    return true;
+}
+
+static bool agent_glm_arg_value_close_tail(const char *tail, size_t len,
+                                           bool *complete) {
+    static const char close[] = "</arg_value>";
+    *complete = false;
+    size_t close_len = sizeof(close) - 1;
+    if (len <= close_len && memcmp(close, tail, len) == 0) {
+        *complete = len == close_len;
+        return true;
+    }
+    return false;
+}
+
+static bool agent_tool_value_close_tail(agent_tool_syntax syntax,
+                                        const char *tail, size_t len,
+                                        bool *complete) {
+    if (syntax == AGENT_TOOL_SYNTAX_GLM)
+        return agent_glm_arg_value_close_tail(tail, len, complete);
+    return agent_dsml_parameter_close_tail(tail, len, complete);
+}
+
+static void agent_dsml_update_param_close_prefix(agent_dsml_parser *p) {
+    p->param_close_prefix = false;
+    if (p->state != AGENT_DSML_PARAM_VALUE || p->raw_len <= p->param_value_start)
+        return;
+
+    const char *value = p->raw + p->param_value_start;
+    const char *end = p->raw + p->raw_len;
+    const char *lt = end;
+    while (lt > value) {
+        lt--;
+        if (*lt == '<') break;
+    }
+    if (lt < value || *lt != '<') return;
+
+    size_t tail_len = (size_t)(end - lt);
+    if (tail_len > 64) return;
+    bool complete = false;
+    p->param_close_prefix =
+        agent_tool_value_close_tail(p->syntax, lt, tail_len, &complete) &&
+        !complete;
+}
+
+/* Find a DSML closing tag while accepting the few harmless closing-tag variants
+ * the model has been observed to emit.  Opening tags stay strict so accidental
+ * prose does not become a tool call. */
+static char *agent_dsml_find_close_tag(const char *s, const char *name, size_t *tag_len) {
+    const char *p = s;
+    while ((p = strstr(p, "</｜DSML｜")) != NULL) {
+        if (agent_dsml_close_tag_at(p, name, tag_len)) return (char *)p;
+        p++;
+    }
+    return NULL;
+}
+
+static bool agent_bytes_starts_with(const char *p, const char *end,
+                                    const char *prefix) {
+    size_t n = strlen(prefix);
+    return (size_t)(end - p) >= n && memcmp(p, prefix, n) == 0;
+}
+
+static bool agent_bytes_partial_prefix_at(const char *p, const char *end,
+                                          const char *prefix) {
+    return bytes_is_partial_prefix(p, (size_t)(end - p), prefix);
+}
+
+static void agent_glm_tool_parse(agent_dsml_parser *p) {
+    static const char start[] = "<tool_call>";
+    static const char close[] = "</tool_call>";
+    static const char arg_key[] = "<arg_key>";
+    static const char arg_key_close[] = "</arg_key>";
+    static const char arg_value[] = "<arg_value>";
+    static const char arg_value_close[] = "</arg_value>";
+
+    if (p->raw_len < sizeof(start) - 1 ||
+        memcmp(p->raw, start, sizeof(start) - 1) != 0) {
+        return;
+    }
+
+    while (p->state == AGENT_DSML_STRUCTURAL ||
+           p->state == AGENT_DSML_PARAM_VALUE)
+    {
+        const char *raw = p->raw;
+        const char *end = p->raw + p->raw_len;
+        if (p->state == AGENT_DSML_PARAM_VALUE) {
+            const char *value_end = strstr(raw + p->param_value_start, arg_value_close);
+            if (!value_end) return;
+            agent_tool_call_add_arg(&p->current, p->param_name ? p->param_name : "",
+                                    raw + p->param_value_start,
+                                    (size_t)(value_end - (raw + p->param_value_start)),
+                                    true, arg_value_close);
+            free(p->param_name);
+            p->param_name = NULL;
+            p->param_close_prefix = false;
+            p->parse_pos = (size_t)(value_end - raw) + sizeof(arg_value_close) - 1;
+            p->state = AGENT_DSML_STRUCTURAL;
+            continue;
+        }
+
+        while (p->parse_pos < p->raw_len &&
+               (p->raw[p->parse_pos] == ' ' || p->raw[p->parse_pos] == '\t' ||
+                p->raw[p->parse_pos] == '\r' || p->raw[p->parse_pos] == '\n'))
+            p->parse_pos++;
+        if (p->parse_pos >= p->raw_len) return;
+
+        const char *cur = raw + p->parse_pos;
+        if (p->glm_after_call) {
+            if (agent_bytes_starts_with(cur, end, start)) {
+                p->parse_pos += sizeof(start) - 1;
+                p->glm_after_call = false;
+                continue;
+            }
+            if (agent_bytes_partial_prefix_at(cur, end, start)) return;
+            p->glm_after_call = false;
+            p->state = AGENT_DSML_DONE;
+            return;
+        }
+
+        if (!p->current.name) {
+            const char *name_start = agent_skip_ascii_space(cur, end);
+            const char *lt = memchr(name_start, '<', (size_t)(end - name_start));
+            if (!lt) return;
+            bool at_arg = agent_bytes_starts_with(lt, end, arg_key);
+            bool at_close = agent_bytes_starts_with(lt, end, close);
+            if (!at_arg && !at_close) {
+                if (agent_bytes_partial_prefix_at(lt, end, arg_key) ||
+                    agent_bytes_partial_prefix_at(lt, end, close))
+                    return;
+                agent_dsml_set_error(p, "expected <arg_key> or </tool_call> in GLM tool call");
+                return;
+            }
+            const char *name_end = lt;
+            agent_trim_span(&name_start, &name_end);
+            if (name_start >= name_end) {
+                agent_dsml_set_error(p, "GLM tool call without function name");
+                return;
+            }
+            agent_tool_call_free(&p->current);
+            p->current.name = xstrndup(name_start, (size_t)(name_end - name_start));
+            p->parse_pos = (size_t)(lt - raw);
+            cur = raw + p->parse_pos;
+        }
+
+        if (agent_bytes_starts_with(cur, end, close)) {
+            p->parse_pos += sizeof(close) - 1;
+            agent_tool_calls_push(&p->calls, &p->current);
+            p->glm_after_call = true;
+            continue;
+        }
+        if (agent_bytes_partial_prefix_at(cur, end, close)) return;
+
+        if (!agent_bytes_starts_with(cur, end, arg_key)) {
+            if (agent_bytes_partial_prefix_at(cur, end, arg_key)) return;
+            agent_dsml_set_error(p, "expected <arg_key> in GLM tool call");
+            return;
+        }
+        cur += sizeof(arg_key) - 1;
+        const char *key_end_mut = strstr(cur, arg_key_close);
+        if (!key_end_mut) return;
+        const char *key_start = cur;
+        const char *key_end = key_end_mut;
+        agent_trim_span(&key_start, &key_end);
+        if (key_start >= key_end) {
+            agent_dsml_set_error(p, "empty <arg_key> in GLM tool call");
+            return;
+        }
+        char *key = xstrndup(key_start, (size_t)(key_end - key_start));
+        ds4_tool_text_unescape(key, arg_key_close);
+        cur = key_end_mut + sizeof(arg_key_close) - 1;
+        cur = agent_skip_ascii_space(cur, end);
+        if (!agent_bytes_starts_with(cur, end, arg_value)) {
+            if (agent_bytes_partial_prefix_at(cur, end, arg_value)) {
+                free(key);
+                return;
+            }
+            free(key);
+            agent_dsml_set_error(p, "expected <arg_value> in GLM tool call");
+            return;
+        }
+        cur += sizeof(arg_value) - 1;
+        free(p->param_name);
+        p->param_name = key;
+        p->param_is_string = true;
+        p->param_value_start = (size_t)(cur - raw);
+        p->parse_pos = p->param_value_start;
+        p->param_close_prefix = false;
+        p->state = AGENT_DSML_PARAM_VALUE;
+    }
+}
+
+static void agent_dsml_finish(agent_dsml_parser *p) {
+    if (!p || p->state == AGENT_DSML_DONE || p->state == AGENT_DSML_ERROR)
+        return;
+    if (p->syntax != AGENT_TOOL_SYNTAX_GLM || !p->glm_after_call)
+        return;
+
+    while (p->parse_pos < p->raw_len &&
+           (p->raw[p->parse_pos] == ' ' || p->raw[p->parse_pos] == '\t' ||
+            p->raw[p->parse_pos] == '\r' || p->raw[p->parse_pos] == '\n'))
+        p->parse_pos++;
+    if (p->parse_pos >= p->raw_len) {
+        p->glm_after_call = false;
+        p->state = AGENT_DSML_DONE;
+    }
+}
+
+/* Parse as much of the accumulated DSML buffer as possible.  The parser can be
+ * called after every streamed byte: incomplete input leaves state unchanged
+ * until enough bytes arrive, while malformed completed input switches to
+ * AGENT_DSML_ERROR so the model gets a retryable tool error. */
+static void agent_dsml_parse(agent_dsml_parser *p) {
+    if (p->syntax == AGENT_TOOL_SYNTAX_GLM) {
+        agent_glm_tool_parse(p);
+        return;
+    }
+
+    while (p->state == AGENT_DSML_STRUCTURAL || p->state == AGENT_DSML_PARAM_VALUE) {
+        if (p->state == AGENT_DSML_PARAM_VALUE) {
+            size_t end_tag_len = 0;
+            char *end = agent_dsml_find_close_tag(p->raw + p->param_value_start,
+                                                  "parameter", &end_tag_len);
+            if (!end) return;
+            agent_tool_call_add_arg(&p->current, p->param_name ? p->param_name : "",
+                                    p->raw + p->param_value_start,
+                                    (size_t)(end - (p->raw + p->param_value_start)),
+                                    p->param_is_string, "</｜DSML｜parameter>");
+            p->param_close_prefix = false;
+            free(p->param_name);
+            p->param_name = NULL;
+            p->parse_pos = (size_t)(end - p->raw) + end_tag_len;
+            p->state = AGENT_DSML_STRUCTURAL;
+            continue;
+        }
+
+        while (p->parse_pos < p->raw_len &&
+               (p->raw[p->parse_pos] == ' ' || p->raw[p->parse_pos] == '\t' ||
+                p->raw[p->parse_pos] == '\r' || p->raw[p->parse_pos] == '\n'))
+            p->parse_pos++;
+        if (p->parse_pos >= p->raw_len) return;
+
+        size_t close_len = 0;
+        if (agent_dsml_close_tag_at(p->raw + p->parse_pos, "tool_calls", &close_len)) {
+            agent_tool_calls_push(&p->calls, &p->current);
+            p->parse_pos += close_len;
+            p->state = AGENT_DSML_DONE;
+            return;
+        }
+        if (agent_dsml_close_tag_at(p->raw + p->parse_pos, "invoke", &close_len)) {
+            agent_tool_calls_push(&p->calls, &p->current);
+            p->parse_pos += close_len;
+            continue;
+        }
+
+        char *tag_end = strchr(p->raw + p->parse_pos, '>');
+        if (!tag_end) return;
+        size_t tag_len = (size_t)(tag_end - (p->raw + p->parse_pos)) + 1;
+        char *tag = xstrndup(p->raw + p->parse_pos, tag_len);
+
+        if (agent_dsml_open_tag_is(tag, "invoke")) {
+            agent_tool_call_free(&p->current);
+            p->current.name = agent_parse_attr(tag, "name");
+            if (!p->current.name) {
+                free(tag);
+                agent_dsml_set_error(p, "tool invoke without name");
+                return;
+            }
+            p->parse_pos += tag_len;
+        } else if (agent_dsml_open_tag_is(tag, "parameter")) {
+            free(p->param_name);
+            p->param_name = agent_parse_attr(tag, "name");
+            char *is_string = agent_parse_attr(tag, "string");
+            p->param_is_string = is_string && !strcmp(is_string, "true");
+            free(is_string);
+            if (!p->param_name) {
+                free(tag);
+                agent_dsml_set_error(p, "tool parameter without name");
+                return;
+            }
+            p->parse_pos += tag_len;
+            p->param_value_start = p->parse_pos;
+            p->param_close_prefix = false;
+            p->state = AGENT_DSML_PARAM_VALUE;
+        } else {
+            snprintf(p->error, sizeof(p->error), "unexpected DSML tag: %.*s",
+                     (int)(tag_len > 80 ? 80 : tag_len), tag);
+            free(tag);
+            p->state = AGENT_DSML_ERROR;
+            return;
+        }
+        free(tag);
+    }
+}
+
+static void agent_dsml_start(agent_dsml_parser *p) {
+    const char *start = p->syntax == AGENT_TOOL_SYNTAX_GLM ?
+        "<tool_call>" : "<｜DSML｜tool_calls>";
+    p->state = AGENT_DSML_STRUCTURAL;
+    p->search_len = 0;
+    agent_dsml_raw_append(p, start, strlen(start));
+    p->parse_pos = strlen(start);
+}
+
+static void agent_dsml_feed(agent_dsml_parser *p, const char *s, size_t n) {
+    const char *start = p->syntax == AGENT_TOOL_SYNTAX_GLM ?
+        "<tool_call>" : "<｜DSML｜tool_calls>";
+    const size_t start_len = strlen(start);
+    if (p->state == AGENT_DSML_DONE || p->state == AGENT_DSML_ERROR) return;
+
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        if (p->state == AGENT_DSML_SEARCH) {
+            if (p->search_len == sizeof(p->search_tail)) {
+                memmove(p->search_tail, p->search_tail + 1, --p->search_len);
+            }
+            p->search_tail[p->search_len++] = c;
+            if (p->search_len >= start_len &&
+                memcmp(p->search_tail + p->search_len - start_len, start, start_len) == 0)
+                agent_dsml_start(p);
+            continue;
+        }
+
+        agent_dsml_raw_append(p, &c, 1);
+        agent_dsml_parse(p);
+        if (p->state == AGENT_DSML_PARAM_VALUE)
+            agent_dsml_update_param_close_prefix(p);
+        else
+            p->param_close_prefix = false;
+    }
+}
+
+static bool agent_stream_dsml_start_match(agent_tool_syntax syntax,
+                                          const char *tail, size_t len,
+                                          bool *complete,
+                                          bool *implicit_invoke) {
+    if (syntax == AGENT_TOOL_SYNTAX_GLM) {
+        static const char glm_call[] = "<tool_call>";
+        size_t form_len = sizeof(glm_call) - 1;
+        *complete = false;
+        *implicit_invoke = false;
+        if (len <= form_len && memcmp(glm_call, tail, len) == 0) {
+            *complete = len == form_len;
+            return true;
+        }
+        return false;
+    }
+
+    static const char canonical[] = "<｜DSML｜tool_calls>";
+    static const char missing_bar[] = "<DSML｜tool_calls>";
+    static const char invoke[] = "<｜DSML｜invoke";
+    static const char invoke_missing_bar[] = "<DSML｜invoke";
+    struct {
+        const char *text;
+        bool implicit_invoke;
+    } forms[] = {
+        {canonical, false},
+        {missing_bar, false},
+        {invoke, true},
+        {invoke_missing_bar, true},
+    };
+    *complete = false;
+    *implicit_invoke = false;
+    for (size_t i = 0; i < sizeof(forms)/sizeof(forms[0]); i++) {
+        size_t form_len = strlen(forms[i].text);
+        if (len <= form_len && memcmp(forms[i].text, tail, len) == 0) {
+            *complete = len == form_len;
+            *implicit_invoke = forms[i].implicit_invoke;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool agent_tail_matches(const char *tail, size_t len,
+                               const char *needle, size_t needle_len) {
+    return len >= needle_len &&
+           memcmp(tail + len - needle_len, needle, needle_len) == 0;
+}
+
+/* Detect DSML-looking control markers in text that is not currently owned by
+ * the executable DSML parser.  This helper intentionally has no policy: inside
+ * <think> the marker means "tool call attempted too early", while in normal
+ * assistant output it means malformed DSML that the model should see as a tool
+ * error. */
+static bool agent_dsml_marker_detector_feed(agent_dsml_marker_detector *d,
+                                            char c) {
+    if (d->len == sizeof(d->tail)) {
+        memmove(d->tail, d->tail + 1, sizeof(d->tail) - 1);
+        d->len--;
+    }
+    d->tail[d->len++] = c;
+
+    static const char fullwidth_marker[] = "｜DSML｜";
+    static const char ascii_marker[] = "|DSML|";
+    static const char missing_open[] = "<DSML｜";
+    static const char missing_close[] = "</DSML｜";
+    return agent_tail_matches(d->tail, d->len,
+                              fullwidth_marker, sizeof(fullwidth_marker) - 1) ||
+           agent_tail_matches(d->tail, d->len,
+                              ascii_marker, sizeof(ascii_marker) - 1) ||
+           agent_tail_matches(d->tail, d->len,
+                              missing_open, sizeof(missing_open) - 1) ||
+           agent_tail_matches(d->tail, d->len,
+                              missing_close, sizeof(missing_close) - 1);
+}
+
+/* -- (kind, text) fragment emitter with per-kind coalescing --------- */
+
+/* Sink for a coalesced fragment: kind is enum agent_stream_kind. In the server
+ * this feeds the STREAM writer (T6); the Layer 3 test captures it directly. */
+typedef void (*srv_emit_fn)(void *ud, uint32_t stream_id, uint32_t kind,
+                            const char *text, size_t len);
+
+typedef struct {
+    agent_dsml_parser *parser;
+    agent_tool_syntax syntax;
+    agent_worker *worker;   /* for agent_trace; NULL in unit tests */
+    srv_emit_fn emit;
+    void *emit_ud;
+
+    /* coalescing */
+    int cur_kind;           /* -1 when nothing buffered */
+    char *cbuf;
+    size_t clen;
+    size_t ccap;
+    uint32_t stream_id;
+    bool at_newline;        /* last emitted byte was '\n' (for notice framing) */
+
+    /* <think>/</think> stripping (consumed here, never sent) */
+    bool in_think;
+    char pending[16];
+    size_t pending_len;
+
+    /* DSML/GLM start-marker detection in the visible stream */
+    bool dsml_active;
+    bool dsml_ignored;      /* stanza opened inside <think> */
+    char dsml_start_tail[64];
+    size_t dsml_start_len;
+    bool post_think_gap;
+
+    /* stray-marker detectors (malformed DSML outside a valid block) */
+    agent_dsml_marker_detector plain_dsml;
+    agent_dsml_marker_detector think_dsml;
+    bool dsml_in_think;
+    bool dsml_in_think_reported;
+
+    /* tool-call fragment tracking (mirrors parser progress) */
+    bool tool_announced;
+    char tool_name[64];
+    bool param_active;
+    char param_name[64];
+    char param_end_tail[64];
+    size_t param_end_len;
+} srv_stream;
+
+static void srv_stream_flush(srv_stream *s) {
+    if (s->cur_kind < 0 || s->clen == 0) {
+        s->cur_kind = -1;
+        s->clen = 0;
+        return;
+    }
+    if (s->emit)
+        s->emit(s->emit_ud, ++s->stream_id, (uint32_t)s->cur_kind,
+                s->cbuf, s->clen);
+    s->clen = 0;
+    s->cur_kind = -1;
+}
+
+static void srv_emit(srv_stream *s, int kind, const char *text, size_t len) {
+    if (!len) return;
+    if (s->cur_kind != -1 && s->cur_kind != kind) srv_stream_flush(s);
+    s->cur_kind = kind;
+    if (s->clen + len > s->ccap) {
+        size_t cap = s->ccap ? s->ccap * 2 : 256;
+        while (cap < s->clen + len) cap *= 2;
+        s->cbuf = xrealloc(s->cbuf, cap);
+        s->ccap = cap;
+    }
+    memcpy(s->cbuf + s->clen, text, len);
+    s->clen += len;
+    for (size_t i = 0; i < len; i++) s->at_newline = text[i] == '\n';
+}
+
+static void srv_emit_cstr(srv_stream *s, int kind, const char *str) {
+    srv_emit(s, kind, str, strlen(str));
+}
+
+/* Emit a bracketed notice ("[invalid tool call: ...]") on its own line, as
+ * NORMAL text (the client colours it). */
+static void srv_emit_notice(srv_stream *s, const char *body) {
+    if (!s->at_newline) srv_emit(s, AGENT_STREAM_NORMAL, "\n", 1);
+    srv_emit_cstr(s, AGENT_STREAM_NORMAL, body);
+}
+
+/* -- tool-call structure -> TOOL_NAME / TOOL_PARAM_NAME fragments --- */
+
+static void srv_stream_tool_events(srv_stream *s) {
+    agent_dsml_parser *p = s->parser;
+    if (!s->tool_announced && p->current.name) {
+        snprintf(s->tool_name, sizeof(s->tool_name), "%s", p->current.name);
+        s->tool_announced = true;
+        srv_emit_cstr(s, AGENT_STREAM_TOOL_NAME, p->current.name);
+    }
+    if (s->tool_announced && !p->current.name && !s->param_active) {
+        /* the current call was pushed to p->calls; ready for the next one */
+        s->tool_announced = false;
+        s->tool_name[0] = '\0';
+    }
+    if (!s->param_active && p->state == AGENT_DSML_PARAM_VALUE && p->param_name) {
+        snprintf(s->param_name, sizeof(s->param_name), "%s", p->param_name);
+        s->param_active = true;
+        s->param_end_len = 0;
+        srv_emit_cstr(s, AGENT_STREAM_TOOL_PARAM_NAME, p->param_name);
+    }
+}
+
+static void srv_stream_param_end(srv_stream *s) {
+    s->param_active = false;
+    s->param_name[0] = '\0';
+    s->param_end_len = 0;
+}
+
+/* One parameter-value byte. Mirrors agent_tool_viz_param_value_byte: hold back
+ * a possible closing tag ("</｜DSML｜parameter>" / "</arg_value>") so its
+ * bytes never leak into a TOOL_PARAM_VALUE fragment. */
+static void srv_stream_param_value_byte(srv_stream *s, char c) {
+    if (s->param_end_len || c == '<') {
+        if (s->param_end_len == sizeof(s->param_end_tail)) {
+            size_t keep = s->param_end_len;
+            s->param_end_len = 0;
+            srv_emit(s, AGENT_STREAM_TOOL_PARAM_VALUE, s->param_end_tail, keep);
+            if (c != '<') {
+                srv_emit(s, AGENT_STREAM_TOOL_PARAM_VALUE, &c, 1);
+                return;
+            }
+        }
+        if (s->param_end_len < sizeof(s->param_end_tail))
+            s->param_end_tail[s->param_end_len++] = c;
+        bool complete = false;
+        if (agent_tool_value_close_tail(s->parser->syntax, s->param_end_tail,
+                                        s->param_end_len, &complete)) {
+            if (complete) srv_stream_param_end(s);
+            return;
+        }
+        size_t keep = s->param_end_len;
+        s->param_end_len = 0;
+        srv_emit(s, AGENT_STREAM_TOOL_PARAM_VALUE, s->param_end_tail, keep);
+        return;
+    }
+    srv_emit(s, AGENT_STREAM_TOOL_PARAM_VALUE, &c, 1);
+}
+
+/* -- notices -------------------------------------------------------- */
+
+static void srv_stream_finish_ignored_dsml(srv_stream *s, const char *detail) {
+    const char *msg = detail && detail[0] ? detail :
+        "tool calling is not allowed inside <think></think>";
+    s->dsml_in_think = true;
+    s->dsml_in_think_reported = true;
+    agent_trace(s->worker, "dsml ignored inside thinking: %s", msg);
+    char line[320];
+    snprintf(line, sizeof(line), "[tool call ignored: %s]\n", msg);
+    srv_emit_notice(s, line);
+    agent_dsml_parser_reset(s->parser);
+    s->dsml_active = false;
+    s->dsml_ignored = false;
+    srv_stream_param_end(s);
+    s->tool_announced = false;
+    s->tool_name[0] = '\0';
+}
+
+static void srv_stream_malformed_dsml(srv_stream *s, const char *detail) {
+    const char *msg = detail && detail[0] ? detail :
+        "DSML markup outside a valid tool_calls block";
+    if (s->parser->state == AGENT_DSML_ERROR) return;
+    agent_dsml_set_error(s->parser, msg);
+    agent_trace(s->worker, "malformed dsml in assistant output: %s", msg);
+    char line[320];
+    snprintf(line, sizeof(line), "[invalid tool call: %s]\n", msg);
+    srv_emit_notice(s, line);
+}
+
+/* -- byte routing ------------------------------------------------- */
+
+static void srv_stream_feed_dsml_byte(srv_stream *s, char c) {
+    bool was_param = !s->dsml_ignored && s->param_active;
+    agent_dsml_feed(s->parser, &c, 1);
+    if (!s->dsml_ignored) {
+        srv_stream_tool_events(s);
+        if (was_param) srv_stream_param_value_byte(s, c);
+        if (was_param && s->parser->state != AGENT_DSML_PARAM_VALUE &&
+            s->param_active)
+            srv_stream_param_end(s);
+    }
+    if (s->parser->state == AGENT_DSML_DONE) {
+        if (s->dsml_ignored) {
+            srv_stream_finish_ignored_dsml(
+                s, "tool calling is not allowed inside <think></think>");
+        } else {
+            agent_trace(s->worker, "dsml done calls=%d", s->parser->calls.len);
+            s->dsml_active = false;
+        }
+    } else if (s->parser->state == AGENT_DSML_ERROR) {
+        if (s->dsml_ignored) {
+            srv_stream_finish_ignored_dsml(
+                s, "malformed tool call inside <think></think>");
+        } else {
+            agent_trace(s->worker, "dsml error %s",
+                        s->parser->error[0] ? s->parser->error : "parse error");
+            if (s->parser->raw && s->parser->raw_len) {
+                if (!s->at_newline) srv_emit(s, AGENT_STREAM_NORMAL, "\n", 1);
+                srv_emit(s, AGENT_STREAM_NORMAL, s->parser->raw,
+                         s->parser->raw_len);
+            }
+            char line[320];
+            snprintf(line, sizeof(line), "[invalid tool call: %s]\n",
+                     s->parser->error[0] ? s->parser->error : "parse error");
+            srv_emit_notice(s, line);
+            s->dsml_active = false;
+        }
+    }
+}
+
+static void srv_stream_start_dsml(srv_stream *s, bool ignored) {
+    s->dsml_active = true;
+    s->dsml_ignored = ignored;
+    if (ignored) s->dsml_in_think = true;
+    s->dsml_start_len = 0;
+    s->post_think_gap = false;
+    agent_trace(s->worker, "%s tool start detected%s",
+                s->syntax == AGENT_TOOL_SYNTAX_GLM ? "glm" : "dsml",
+                ignored ? " inside thinking" : "");
+    agent_dsml_start(s->parser);
+    if (!ignored) srv_stream_tool_events(s);
+}
+
+static void srv_stream_note_plain_dsml_byte(srv_stream *s, char c);
+
+static void srv_stream_flush_start_tail(srv_stream *s) {
+    if (!s->dsml_start_len) return;
+    s->post_think_gap = false;
+    for (size_t i = 0; i < s->dsml_start_len; i++) {
+        char c = s->dsml_start_tail[i];
+        srv_emit(s, s->in_think ? AGENT_STREAM_THINK : AGENT_STREAM_NORMAL, &c, 1);
+        srv_stream_note_plain_dsml_byte(s, c);
+        if (s->parser->state == AGENT_DSML_ERROR) break;
+    }
+    s->dsml_start_len = 0;
+}
+
+static void srv_stream_note_thinking_dsml_byte(srv_stream *s, char c) {
+    if (!s->in_think || s->dsml_in_think) return;
+    if (agent_dsml_marker_detector_feed(&s->think_dsml, c))
+        s->dsml_in_think = true;
+}
+
+static void srv_stream_note_plain_dsml_byte(srv_stream *s, char c) {
+    if (s->parser->state == AGENT_DSML_ERROR) return;
+    if (s->dsml_active || s->in_think || s->dsml_in_think) return;
+    if (agent_dsml_marker_detector_feed(&s->plain_dsml, c))
+        srv_stream_malformed_dsml(
+            s, "DSML markup outside a valid tool_calls block");
+}
+
+static void srv_stream_normal_byte(srv_stream *s, char c) {
+    static const char canonical_invoke[] = "<｜DSML｜invoke";
+    const char *start = s->syntax == AGENT_TOOL_SYNTAX_GLM ?
+        "<tool_call>" : "<｜DSML｜tool_calls>";
+    if (s->parser->state == AGENT_DSML_ERROR) return;
+    srv_stream_note_thinking_dsml_byte(s, c);
+
+    if (s->post_think_gap &&
+        (c == ' ' || c == '\t' || c == '\r' || c == '\n'))
+        return;
+
+    if (s->dsml_start_len || c == start[0]) {
+        if (s->dsml_start_len < sizeof(s->dsml_start_tail))
+            s->dsml_start_tail[s->dsml_start_len++] = c;
+        bool complete = false, implicit_invoke = false;
+        if (agent_stream_dsml_start_match(s->syntax, s->dsml_start_tail,
+                                          s->dsml_start_len, &complete,
+                                          &implicit_invoke)) {
+            if (complete) {
+                srv_stream_start_dsml(s, s->in_think);
+                if (s->syntax == AGENT_TOOL_SYNTAX_DSML && implicit_invoke) {
+                    for (size_t i = 0; i < sizeof(canonical_invoke) - 1; i++)
+                        srv_stream_feed_dsml_byte(s, canonical_invoke[i]);
+                }
+            }
+            return;
+        }
+        if (s->dsml_start_len > 1 &&
+            s->dsml_start_tail[s->dsml_start_len - 1] == start[0]) {
+            s->post_think_gap = false;
+            size_t flush = s->dsml_start_len - 1;
+            for (size_t i = 0; i < flush; i++) {
+                char b = s->dsml_start_tail[i];
+                srv_emit(s, s->in_think ? AGENT_STREAM_THINK : AGENT_STREAM_NORMAL,
+                         &b, 1);
+                srv_stream_note_plain_dsml_byte(s, b);
+                if (s->parser->state == AGENT_DSML_ERROR) break;
+            }
+            if (s->parser->state == AGENT_DSML_ERROR) {
+                s->dsml_start_len = 0;
+                return;
+            }
+            s->dsml_start_tail[0] = start[0];
+            s->dsml_start_len = 1;
+            return;
+        }
+        srv_stream_flush_start_tail(s);
+        return;
+    }
+
+    s->post_think_gap = false;
+    srv_emit(s, s->in_think ? AGENT_STREAM_THINK : AGENT_STREAM_NORMAL, &c, 1);
+    srv_stream_note_plain_dsml_byte(s, c);
+}
+
+/* Top-level: classify one chunk of sampled assistant text into fragments. The
+ * transcript is unchanged; only the projection is rewritten. */
+static void srv_stream_text(srv_stream *s, const char *text, size_t len,
+                            bool finish) {
+    const char *think_open = "<think>";
+    const char *think_close = "</think>";
+    size_t total = s->pending_len + len;
+    char *buf = xmalloc(total ? total : 1);
+    if (s->pending_len) memcpy(buf, s->pending, s->pending_len);
+    if (len) memcpy(buf + s->pending_len, text, len);
+    s->pending_len = 0;
+
+    size_t i = 0;
+    while (i < total) {
+        char *cur = buf + i;
+        size_t rem = total - i;
+        if (!s->dsml_active && bytes_has_prefix(cur, rem, think_open)) {
+            srv_stream_flush_start_tail(s);
+            s->post_think_gap = false;
+            s->in_think = true;
+            i += strlen(think_open);
+            continue;
+        }
+        if (!s->dsml_active && bytes_has_prefix(cur, rem, think_close)) {
+            srv_stream_flush_start_tail(s);
+            s->in_think = false;
+            if (!s->at_newline) srv_emit(s, AGENT_STREAM_NORMAL, "\n", 1);
+            srv_emit(s, AGENT_STREAM_NORMAL, "\n", 1);
+            s->post_think_gap = true;
+            i += strlen(think_close);
+            continue;
+        }
+        if (!finish && !s->dsml_active && cur[0] == '<' &&
+            (bytes_is_partial_prefix(cur, rem, think_open) ||
+             bytes_is_partial_prefix(cur, rem, think_close))) {
+            if (rem < sizeof(s->pending)) {
+                memcpy(s->pending, cur, rem);
+                s->pending_len = rem;
+            }
+            break;
+        }
+
+        if (s->dsml_active)
+            srv_stream_feed_dsml_byte(s, cur[0]);
+        else
+            srv_stream_normal_byte(s, cur[0]);
+        i++;
+    }
+    free(buf);
+
+    if (finish) {
+        srv_stream_flush_start_tail(s);
+        s->post_think_gap = false;
+        if (s->dsml_active) agent_dsml_finish(s->parser);
+        if (s->dsml_active) {
+            if (s->parser->state == AGENT_DSML_DONE) {
+                if (s->dsml_ignored)
+                    srv_stream_finish_ignored_dsml(
+                        s, "tool calling is not allowed inside <think></think>");
+                else {
+                    agent_trace(s->worker, "dsml done calls=%d",
+                                s->parser->calls.len);
+                    s->dsml_active = false;
+                }
+            } else if (s->dsml_ignored) {
+                srv_stream_finish_ignored_dsml(
+                    s, "tool calling is not allowed inside <think></think>");
+            } else {
+                srv_emit_notice(s, "[tool call interrupted]\n");
+                s->dsml_active = false;
+            }
+        }
+        if (s->dsml_in_think && !s->dsml_in_think_reported)
+            srv_stream_finish_ignored_dsml(
+                s, "tool calling is not allowed inside <think></think>");
+        srv_stream_flush(s);
+    }
+}
+
+static void srv_stream_init(srv_stream *s, agent_dsml_parser *parser,
+                            agent_tool_syntax syntax, agent_worker *worker,
+                            srv_emit_fn emit, void *emit_ud) {
+    memset(s, 0, sizeof(*s));
+    s->parser = parser;
+    s->syntax = syntax;
+    s->worker = worker;
+    s->emit = emit;
+    s->emit_ud = emit_ud;
+    s->cur_kind = -1;
+    s->at_newline = true;
+}
+
+static void srv_stream_free(srv_stream *s) {
+    free(s->cbuf);
+    s->cbuf = NULL;
+    s->clen = s->ccap = 0;
+}
+
+/* Greedy-sampling decision: stays server-side, so there is no per-token
+ * round-trip. Copied from ds4_agent.c, retargeted to srv_stream. */
+static bool agent_stream_wants_greedy_sampling(const srv_stream *s) {
+    if (!s || !s->parser) return false;
+    if (s->parser->state == AGENT_DSML_ERROR ||
+        s->parser->state == AGENT_DSML_DONE)
+        return false;
+    if (s->dsml_start_len > 1) return true;
+    if (!s->dsml_active) return false;
+    if (s->parser->state == AGENT_DSML_STRUCTURAL) return true;
+    if (s->parser->state != AGENT_DSML_PARAM_VALUE) return false;
+    return s->parser->param_close_prefix;
+}
+
+static bool agent_stream_compaction_needs_lookahead(const srv_stream *s) {
+    return !s->dsml_active && s->parser->state == AGENT_DSML_SEARCH &&
+           (s->pending_len || s->dsml_start_len);
 }
 
 

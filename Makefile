@@ -370,10 +370,10 @@ ds4_agent_proto.o: ds4_agent_proto.c ds4_agent_proto.h
 ds4_agent_utils.o: ds4_agent_utils.c ds4_agent_utils.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_agent_utils.c
 
-ds4_agent_server.o: ds4_agent_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_help.h ds4_gpu_args.h ds4_kvstore.h ds4_prompt_prefix.h ds4_agent_proto.h ds4_agent_utils.h
+ds4_agent_server.o: ds4_agent_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_help.h ds4_gpu_args.h ds4_kvstore.h ds4_prompt_prefix.h ds4_tool_text.h ds4_agent_proto.h ds4_agent_utils.h
 	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ ds4_agent_server.c
 
-ds4_agent_server_cpu.o: ds4_agent_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_help.h ds4_gpu_args.h ds4_kvstore.h ds4_prompt_prefix.h ds4_agent_proto.h ds4_agent_utils.h
+ds4_agent_server_cpu.o: ds4_agent_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_help.h ds4_gpu_args.h ds4_kvstore.h ds4_prompt_prefix.h ds4_tool_text.h ds4_agent_proto.h ds4_agent_utils.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -Wno-unused-function -c -o $@ ds4_agent_server.c
 
 ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
