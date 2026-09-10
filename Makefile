@@ -359,6 +359,9 @@ ds4_kvstore.o: ds4_kvstore.c ds4_kvstore.h ds4.h ds4_ssd.h
 ds4_agent_proto.o: ds4_agent_proto.c ds4_agent_proto.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_agent_proto.c
 
+ds4_agent_utils.o: ds4_agent_utils.c ds4_agent_utils.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_agent_utils.c
+
 ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
 	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ds4_test.c
 
@@ -701,8 +704,8 @@ tests/test_prompt_prefix: tests/test_prompt_prefix.o ds4_prompt_prefix.o
 # ds4-agent client/server split (AGENT-SPLIT-PLAN.md). The wire protocol and its
 # test are pure: no engine, no model, no nvcc. test-cpu is the local dev-box gate
 # and grows one prerequisite per task.
-ds4_agent_proto_test: tests/ds4_agent_proto_test.c ds4_agent_proto.o ds4_agent_proto.h
-	$(CC) $(CFLAGS) -I. -o $@ tests/ds4_agent_proto_test.c ds4_agent_proto.o $(LDLIBS)
+ds4_agent_proto_test: tests/ds4_agent_proto_test.c ds4_agent_proto.o ds4_agent_utils.o ds4_agent_proto.h ds4_agent_utils.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/ds4_agent_proto_test.c ds4_agent_proto.o ds4_agent_utils.o $(LDLIBS)
 
 .PHONY: test-cpu
 test-cpu: ds4_agent_proto_test

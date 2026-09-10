@@ -6,10 +6,13 @@
  */
 
 #include "../ds4_agent_proto.h"
+#include "../ds4_agent_utils.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 static int failures;
 
@@ -984,6 +987,113 @@ static void test_msg_names(void) {
     CHECK(strcmp(ap_msg_name(999), "?") == 0);
 }
 
+/* ------------------------------------------------------------------------- */
+/* shared helpers (ds4_agent_utils)                                           */
+/* ------------------------------------------------------------------------- */
+
+static void test_utils_agent_buf_growth(void) {
+    agent_buf b = {0};
+    for (int i = 0; i < 5000; i++) agent_buf_puts(&b, "0123456789");
+    CHECK(b.len == 50000);
+    CHECK(!b.truncated);
+    CHECK(b.ptr[b.len] == '\0');
+    char *taken = agent_buf_take(&b);
+    CHECK(strlen(taken) == 50000);
+    CHECK(b.ptr == NULL && b.len == 0 && b.cap == 0);
+    free(taken);
+}
+
+static void test_utils_agent_buf_truncation(void) {
+    agent_buf b = {0};
+    b.limit = 16;
+    agent_buf_puts(&b, "abcdefghij");        /* 10, fits */
+    agent_buf_puts(&b, "klmnopqrstuvwxyz");  /* crosses the 16-byte limit */
+    CHECK(b.truncated);
+    CHECK(b.len == 16);
+    char *taken = agent_buf_take(&b);
+    CHECK(strncmp(taken, "abcdefghijklmnop", 16) == 0);
+    CHECK(strstr(taken, "[Output truncated") != NULL);
+    free(taken);
+}
+
+static void test_utils_input_buf(void) {
+    agent_input_buf b = {0};
+    agent_input_buf_append(&b, "hello ", 6);
+    agent_input_buf_append(&b, "world", 5);
+    CHECK(b.len == 11 && strcmp(b.ptr, "hello world") == 0);
+    char *taken = agent_input_buf_take(&b);
+    CHECK(strcmp(taken, "hello world") == 0);
+    CHECK(b.ptr == NULL);
+    free(taken);
+
+    /* take on an untouched buffer yields an owned empty string */
+    agent_input_buf empty = {0};
+    char *e = agent_input_buf_take(&empty);
+    CHECK(e && e[0] == '\0');
+    free(e);
+    agent_input_buf_free(&empty);
+}
+
+static void test_utils_parsers(void) {
+    CHECK(parse_int("42", "--x") == 42);
+    CHECK(parse_nonnegative_int("0", "--x") == 0);
+    CHECK(parse_u64("1", "--seed") == 1ull);
+    CHECK(parse_u64("18446744073709551615", "--seed") == UINT64_MAX);
+
+    float f = -1.0f;
+    CHECK(parse_float_range("0.7", "--temp", 0.0f, 2.0f) > 0.69f);
+    CHECK(parse_float_range("0.7", "--temp", 0.0f, 2.0f) < 0.71f);
+
+    int p = 0;
+    CHECK(parse_power_percent("50", &p) && p == 50);
+    CHECK(!parse_power_percent("0", &p));
+    CHECK(!parse_power_percent("101", &p));
+    CHECK(!parse_power_percent("abc", &p));
+
+    CHECK(parse_steering_level("2.5", &f) && f > 2.49f && f < 2.51f);
+    CHECK(parse_steering_level("-3", &f) && f < -2.99f);
+    CHECK(!parse_steering_level("200", &f));
+    CHECK(!parse_steering_level("nan", &f));
+    CHECK(!parse_steering_level("", &f));
+
+    CHECK(agent_parse_bool_default("YES", false) == true);
+    CHECK(agent_parse_bool_default("0", true) == false);
+    CHECK(agent_parse_bool_default("maybe", true) == true);
+    CHECK(agent_parse_bool_default(NULL, true) == true);
+    CHECK(agent_parse_bool_default("", false) == false);
+}
+
+static void test_utils_mkdir_p(void) {
+    char tmpl[] = "/tmp/ds4_agent_utils_XXXXXX";
+    char *base = mkdtemp(tmpl);
+    CHECK(base != NULL);
+    if (!base) return;
+
+    char nested[512];
+    snprintf(nested, sizeof(nested), "%s/a/b/c/d", base);
+    CHECK(agent_mkdir_p(nested));
+    struct stat st;
+    CHECK(stat(nested, &st) == 0 && S_ISDIR(st.st_mode));
+    /* idempotent */
+    CHECK(agent_mkdir_p(nested));
+    CHECK(!agent_mkdir_p(""));
+
+    /* cleanup */
+    char cmd[600];
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", base);
+    CHECK(system(cmd) == 0);
+}
+
+static void test_utils_misc(void) {
+    char *s = xstrndup("abcdef", 3);
+    CHECK(strcmp(s, "abc") == 0);
+    free(s);
+
+    double t0 = now_sec();
+    double t1 = now_sec();
+    CHECK(t1 >= t0);
+}
+
 int main(void) {
     test_primitive_roundtrip();
     test_fixed_width_truncation();
@@ -1014,6 +1124,13 @@ int main(void) {
     test_tool_result_roundtrip();
     test_session_ready_roundtrip();
     test_msg_names();
+
+    test_utils_agent_buf_growth();
+    test_utils_agent_buf_truncation();
+    test_utils_input_buf();
+    test_utils_parsers();
+    test_utils_mkdir_p();
+    test_utils_misc();
 
     if (failures) {
         fprintf(stderr, "%d agent proto test(s) failed\n", failures);
