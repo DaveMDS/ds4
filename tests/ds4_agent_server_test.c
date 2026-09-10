@@ -160,6 +160,60 @@ static void test_session_state_machine(void) {
     CHECK(server_session_resume(&s) == false);
 }
 
+/* T4: the system/tool prompt builders drop the exact/anchored edit toggle and
+ * always emit the exact-match strings (AGENT-SPLIT-PLAN.md section 3b). */
+static void test_tools_prompt_exact_only(void) {
+    char *dsml = agent_build_dsml_tools_prompt(false);
+    char *glm  = agent_build_glm_tools_prompt(false);
+    CHECK(dsml && glm);
+    CHECK(strstr(dsml, "[upto]") == NULL);
+    CHECK(strstr(glm,  "[upto]") == NULL);
+    CHECK(strstr(dsml, "match exactly once") != NULL);
+    CHECK(strstr(glm,  "match exactly once") != NULL);
+    CHECK(strstr(dsml, "view_image") == NULL); /* no vision schema by default */
+
+    char *dsml_v = agent_build_dsml_tools_prompt(true);
+    char *glm_v  = agent_build_glm_tools_prompt(true);
+    CHECK(strstr(dsml_v, "view_image") != NULL);
+    CHECK(strstr(glm_v,  "view_image") != NULL);
+
+    free(dsml);
+    free(glm);
+    free(dsml_v);
+    free(glm_v);
+}
+
+/* T4: the compaction summary prompt is pure text (the rest of compaction is
+ * T6). It forbids tool calls and echoes the reason only when one is given. */
+static void test_compact_make_prompt(void) {
+    char *p = agent_compact_make_prompt("tool result would exceed context");
+    CHECK(strstr(p, "context compaction request") != NULL);
+    CHECK(strstr(p, "do not call tools") != NULL);
+    CHECK(strstr(p, "Compaction reason: tool result would exceed context") != NULL);
+    free(p);
+
+    char *q = agent_compact_make_prompt(NULL);
+    CHECK(strstr(q, "Compaction reason:") == NULL);
+    free(q);
+
+    CHECK(agent_compact_summary_budget(80000) == AGENT_COMPACT_SUMMARY_MAX_TOKENS);
+    CHECK(agent_compact_summary_budget(512) == 256); /* clamped up to the floor */
+}
+
+/* T4: a session's file name is SHA1(title || created_at_le64); it is stable
+ * across resaves and changes only when the title or creation time changes. */
+static void test_identity_sha_stable(void) {
+    char a[41], b[41], c[41], d[41];
+    agent_session_identity_sha("fix the parser", 1710000000ULL, a);
+    agent_session_identity_sha("fix the parser", 1710000000ULL, b);
+    agent_session_identity_sha("fix the parser", 1710000001ULL, c);
+    agent_session_identity_sha("other title",    1710000000ULL, d);
+    CHECK(strlen(a) == 40);
+    CHECK(strcmp(a, b) == 0);
+    CHECK(strcmp(a, c) != 0);
+    CHECK(strcmp(a, d) != 0);
+}
+
 int main(void) {
     test_parse_defaults();
     test_parse_engine_flags();
@@ -167,6 +221,9 @@ int main(void) {
     test_parse_backend_names();
     test_hello_reply_fill();
     test_session_state_machine();
+    test_tools_prompt_exact_only();
+    test_compact_make_prompt();
+    test_identity_sha_stable();
 
     if (failures) {
         fprintf(stderr, "%d agent server test(s) failed\n", failures);
