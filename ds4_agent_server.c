@@ -493,9 +493,11 @@ typedef enum {
  * (T6): a single in-order queue drained by the connection's writer thread. */
 typedef struct srv_msg {
     struct srv_msg *next;
-    uint32_t type;      /* enum agent_msg */
-    ap_buf body;        /* the frame payload, already encoded */
-    bool status_forced; /* STATUS only: a transition/error, never coalesced away */
+    uint32_t type;        /* enum agent_msg */
+    ap_buf body;          /* the frame payload, already encoded */
+    bool status_forced;   /* STATUS only: a transition/error, never coalesced away */
+    uint32_t stream_kind; /* STREAM only: enum agent_stream_kind, for coalescing */
+    uint32_t stream_id;   /* STREAM only */
 } srv_msg;
 
 /* Raw image bytes carried across the tool-exec handshake (owned copies). */
@@ -599,6 +601,9 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
 static char *agent_session_title_from_text(const char *text, size_t text_len,
                                            size_t max_bytes);
 static void *worker_main(void *arg);
+static bool agent_worker_compact(agent_worker *w, const char *reason,
+                                 char *err, size_t err_len);
+static bool agent_worker_has_user_session(agent_worker *w);
 
 /* Output FIFO helpers (defined in the reader/writer section below). All assume
  * w->mu is held. */
@@ -610,6 +615,17 @@ static void srv_fifo_push_stream_locked(agent_worker *w, uint32_t kind,
 /* Turn-suspend handshakes: the reader thread wakes the worker (T6b section). */
 static void worker_answer_tool_exec(agent_worker *w, const ap_tool_result *tr);
 static void worker_answer_queued_user_drain(agent_worker *w, char *text);
+
+/* Context compaction (T6c section). */
+static bool agent_worker_compact(agent_worker *w, const char *reason,
+                                 char *err, size_t err_len);
+static bool agent_worker_compact_transcript(agent_worker *w, const char *reason,
+                                            int *open_assistant,
+                                            char *err, size_t err_len);
+static bool agent_worker_compact_if_needed(agent_worker *w, const char *reason,
+                                           char *err, size_t err_len);
+static bool agent_worker_should_compact(agent_worker *w);
+static bool agent_worker_has_user_session(agent_worker *w);
 
 /* -- syntax helpers, effective ctx / think mode ------------------------- */
 
@@ -2062,19 +2078,43 @@ static bool worker_is_initialized(agent_worker *w, agent_status *status) {
     return initialized;
 }
 
-/* -- turn loop (defined in the T6b section) + T7 deferred stubs ---- */
+/* -- turn loop + compaction live in the T6b/T6c sections below ---- */
 
 static int worker_run_turn(agent_worker *w, const char *user_text);
 
+/* Deferred /save still lands in T7. */
 static void worker_run_deferred_save(agent_worker *w) {
     if (!worker_take_save_requested(w)) return;
     agent_trace(w, "deferred save: session persistence lands in T7");
     agent_set_status(w, AGENT_WORKER_IDLE);
 }
 
+/* /compact issued while the worker was busy: run it now (copy of ds4_agent.c
+ * worker_run_deferred_compact, without the local terminal prints). */
 static void worker_run_deferred_compact(agent_worker *w) {
     if (!worker_take_compact_requested(w)) return;
-    agent_trace(w, "deferred compact: compaction lands in T6");
+    if (!agent_worker_has_user_session(w)) {
+        agent_publish_system_status(w, "compact skipped: nothing to compact");
+        return;
+    }
+    int before = w->transcript.len;
+    char err[160] = {0};
+    if (agent_worker_compact(w, "user requested compaction", err, sizeof(err))) {
+        if (w->transcript.len != before) {
+            pthread_mutex_lock(&w->mu);
+            w->session_dirty = true;
+            agent_wake_locked(w);
+            pthread_mutex_unlock(&w->mu);
+        } else {
+            agent_publish_system_status(w, "compact skipped: nothing to compact");
+        }
+        agent_set_status(w, AGENT_WORKER_IDLE);
+    } else if (agent_err_is_interrupted(err)) {
+        worker_clear_interrupt(w);
+        agent_set_status(w, AGENT_WORKER_IDLE);
+    } else {
+        agent_set_error(w, err[0] ? err : "context compaction failed");
+    }
 }
 
 /* -- compaction summary prompt (pure text; the rest is T6) ---- */
@@ -3628,6 +3668,8 @@ static void srv_fifo_push_locked(agent_worker *w, uint32_t type, ap_buf *body) {
     srv_msg *m = xmalloc(sizeof(*m));
     m->type = type;
     m->status_forced = false;
+    m->stream_kind = 0;
+    m->stream_id = 0;
     m->body = *body;
     ap_buf_init(body);
     srv_fifo_append_locked(w, m);
@@ -3648,9 +3690,35 @@ static void srv_fifo_push_reply_err(agent_worker *w, uint32_t type,
     ap_buf_free(&b);
 }
 
+#define SRV_STREAM_COALESCE_CAP (1u * 1024u * 1024u)
+
 static void srv_fifo_push_stream_locked(agent_worker *w, uint32_t kind,
                                         const char *text, size_t len) {
     if (!w->out_active || !len) return;
+
+    /* Coalesce with an un-sent same-kind STREAM already at the FIFO tail, so a
+     * per-token compaction summary or a burst of agent_publish() bytes travels
+     * as one frame. */
+    srv_msg *tail = w->fifo_tail;
+    if (tail && tail->type == AGENT_MSG_STREAM && tail->stream_kind == kind) {
+        ap_reader r;
+        ap_reader_init(&r, tail->body.data, tail->body.len);
+        ap_stream old;
+        if (ap_decode_stream(&r, &old) &&
+            old.text_len + len <= SRV_STREAM_COALESCE_CAP) {
+            size_t nlen = old.text_len + len;
+            char *combined = xmalloc(nlen);
+            memcpy(combined, old.text, old.text_len);
+            memcpy(combined + old.text_len, text, len);
+            ap_stream ns = { .stream_id = tail->stream_id, .kind = kind,
+                             .text = combined, .text_len = nlen };
+            ap_buf_reset(&tail->body);
+            ap_encode_stream(&tail->body, &ns);
+            free(combined);
+            return;
+        }
+    }
+
     ap_stream s = {
         .stream_id = ++w->stream_seq,
         .kind = kind,
@@ -3660,6 +3728,8 @@ static void srv_fifo_push_stream_locked(agent_worker *w, uint32_t kind,
     srv_msg *m = xmalloc(sizeof(*m));
     m->type = AGENT_MSG_STREAM;
     m->status_forced = false;
+    m->stream_kind = kind;
+    m->stream_id = s.stream_id;
     ap_buf_init(&m->body);
     ap_encode_stream(&m->body, &s);
     srv_fifo_append_locked(w, m);
@@ -3704,6 +3774,8 @@ static void srv_status_publish_locked(agent_worker *w, bool forced) {
     srv_msg *m = xmalloc(sizeof(*m));
     m->type = AGENT_MSG_STATUS;
     m->status_forced = forced;
+    m->stream_kind = 0;
+    m->stream_id = 0;
     ap_buf_init(&m->body);
     srv_status_encode_locked(w, &m->body);
     srv_fifo_append_locked(w, m);
@@ -4096,25 +4168,8 @@ static int agent_read_default_lines(agent_worker *w) {
 }
 
 
-/* -- compaction: stubbed until T6c ----------------------------- */
-
-static bool agent_worker_should_compact(agent_worker *w) { (void)w; return false; }
-static bool agent_worker_compact_transcript(agent_worker *w, const char *reason,
-                                            int *open_assistant,
-                                            char *err, size_t err_len) {
-    (void)w; (void)reason; (void)open_assistant; (void)err; (void)err_len;
-    return true; /* T6c */
-}
-static bool agent_worker_compact(agent_worker *w, const char *reason,
-                                 char *err, size_t err_len) {
-    (void)w; (void)reason; (void)err; (void)err_len;
-    return true; /* T6c */
-}
-static bool agent_worker_compact_if_needed(agent_worker *w, const char *reason,
-                                           char *err, size_t err_len) {
-    (void)w; (void)reason; (void)err; (void)err_len;
-    return true; /* T6c */
-}
+/* Context compaction is defined further down (after the drain handshake it
+ * uses). Forward-declared here for agent_worker_append_user. */
 
 /* -- user message append + rewind ----------------------------- */
 
@@ -4572,7 +4627,8 @@ static char *worker_request_queued_user_drain(agent_worker *w) {
     w->queued_user_drain_text = NULL;
     srv_fifo_push_locked(w, AGENT_MSG_DRAIN_REQUEST, &empty);
     agent_wake_locked(w);
-    while (!w->stop && !w->queued_user_drain_answered)
+    /* Also break on INTERRUPT: on a client disconnect no DRAIN_REPLY arrives. */
+    while (!w->stop && !w->interrupt && !w->queued_user_drain_answered)
         pthread_cond_wait(&w->cond, &w->mu);
     char *text = w->queued_user_drain_text;
     w->queued_user_drain_text = NULL;
@@ -4599,6 +4655,434 @@ static char *agent_session_title_from_prompt(const char *prompt, size_t max_byte
     return agent_session_title_from_span(p, p + strlen(p), max_bytes,
                                          "(empty user prompt)");
 }
+
+/* ========================================================================= */
+/* T6c: context compaction.                                                   */
+/*                                                                           */
+/* Copied from ds4_agent.c. The painting is rewritten: the COMPACTING banner  */
+/* and reason go out as STREAM{SYSTEM}, the summary tokens as STREAM{SUMMARY}, */
+/* the ANSI colour writes are dropped. Per Risk 7b a successful compaction    */
+/* (outside a still-open assistant message) ends with a DRAIN_REQUEST so the  */
+/* client can prepend its "bash jobs still running" note; the non-empty       */
+/* reply is appended as a tool message.                                       */
+/* ========================================================================= */
+
+#define AGENT_COMPACT_SOFT_PERCENT 85
+#define AGENT_COMPACT_MIN_FREE_TOKENS 8192
+#define AGENT_COMPACT_TAIL_DIVISOR 10
+#define AGENT_COMPACT_TAIL_CAP_TOKENS 50000
+
+static void agent_publishf_system_status(agent_worker *w, const char *fmt, ...) {
+    char stack[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(stack, sizeof(stack), fmt, ap);
+    va_end(ap);
+    if (n <= 0) return;
+    if ((size_t)n < sizeof(stack)) {
+        agent_publish_system_status(w, stack);
+        return;
+    }
+    char *heap = xmalloc((size_t)n + 1);
+    va_start(ap, fmt);
+    vsnprintf(heap, (size_t)n + 1, fmt, ap);
+    va_end(ap);
+    agent_publish_system_status(w, heap);
+    free(heap);
+}
+
+static void srv_summary_emit(agent_worker *w, const char *text, size_t len) {
+    pthread_mutex_lock(&w->mu);
+    srv_fifo_push_stream_locked(w, AGENT_STREAM_SUMMARY, text, len);
+    pthread_mutex_unlock(&w->mu);
+}
+
+static bool agent_worker_has_user_session(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    bool yes = w->user_activity;
+    pthread_mutex_unlock(&w->mu);
+    return yes;
+}
+
+static bool agent_worker_should_compact(agent_worker *w) {
+    int ctx = agent_worker_effective_ctx_size(w);
+    int used = w->transcript.len;
+    if (ctx <= 0 || used <= 0) return false;
+    if (used >= (ctx * AGENT_COMPACT_SOFT_PERCENT) / 100) return true;
+    int free_threshold = AGENT_COMPACT_MIN_FREE_TOKENS;
+    int proportional = ctx / 8;
+    if (free_threshold > proportional) free_threshold = proportional;
+    int reserve = agent_compact_reserve_tokens(w) + 128;
+    if (free_threshold < reserve) free_threshold = reserve;
+    return ctx - used <= free_threshold;
+}
+
+static int agent_special_token_id(ds4_engine *engine, const char *rendered) {
+    ds4_tokens t = {0};
+    ds4_tokenize_rendered_chat(engine, rendered, &t);
+    int id = t.len == 1 ? t.v[0] : -1;
+    ds4_tokens_free(&t);
+    return id;
+}
+
+static int agent_compact_tail_boundary(const ds4_tokens *tokens, int bottom,
+                                       int sys_len, int tail_budget, int user_id) {
+    int target = bottom - tail_budget;
+    if (target < sys_len) target = sys_len;
+    if (user_id < 0) return target;
+
+    /* A slightly longer complete turn is preferable to losing the user's
+     * constraints and keeping only a fragment of our answer. */
+    int earliest = bottom - 2 * tail_budget;
+    if (earliest < sys_len) earliest = sys_len;
+    for (int i = bottom - 1; i >= earliest; i--) {
+        if (tokens->v[i] == user_id) return i;
+    }
+    return target;
+}
+
+/* Prefer a complete recent user turn, with a bounded fragment as fallback. */
+static int agent_compact_tail_start(agent_worker *w, int bottom, int sys_len) {
+    int tail_budget = agent_worker_effective_ctx_size(w) / AGENT_COMPACT_TAIL_DIVISOR;
+    if (tail_budget > AGENT_COMPACT_TAIL_CAP_TOKENS)
+        tail_budget = AGENT_COMPACT_TAIL_CAP_TOKENS;
+    if (tail_budget < 1) tail_budget = 1;
+    int user_id = agent_special_token_id(w->engine,
+        ds4_engine_is_glm_dsa(w->engine) ? "<|user|>" : "<｜User｜>");
+    return agent_compact_tail_boundary(&w->transcript, bottom, sys_len, tail_budget, user_id);
+}
+
+/* A summary prefix or retained tail must never split an image block. */
+static int agent_compact_image_boundary(const ds4_vision_span *images, size_t count,
+                                        bool glm, int pos) {
+    for (size_t i = 0; i < count; i++) {
+        const ds4_vision_span *span = &images[i];
+        int wrapper = glm ? 1 : 0;
+        int start = (int)span->token_start - wrapper;
+        uint64_t end = (uint64_t)span->token_start +
+                       span->embedding.token_count + (unsigned)wrapper;
+        if (pos > start && (uint64_t)pos < end) return start;
+    }
+    return pos;
+}
+
+static bool agent_worker_compact_transcript(agent_worker *w, const char *reason,
+                                  int *open_assistant,
+                                  char *err, size_t err_len) {
+    const int bottom = w->transcript.len;
+    if (bottom <= 0) return true;
+
+    ds4_tokens sys = {0};
+    agent_worker_build_system_tokens(w, &sys);
+    if (bottom <= sys.len) {
+        ds4_tokens_free(&sys);
+        return true;
+    }
+
+    agent_publishf_system_status(w, "COMPACTING (%s): summarizing durable task state",
+                                 reason && reason[0] ? reason : "context");
+
+    char *prompt_text = agent_compact_make_prompt(reason);
+    ds4_tokens summary_suffix = {0};
+    ds4_chat_append_message(w->engine, &summary_suffix, "user", prompt_text);
+    free(prompt_text);
+    ds4_chat_append_assistant_prefix(w->engine, &summary_suffix, DS4_THINK_NONE);
+    const int ctx = agent_worker_effective_ctx_size(w);
+    int summary_budget = agent_compact_summary_budget(ctx);
+    int summary_bottom = bottom;
+    if (summary_bottom > ctx - summary_suffix.len - summary_budget - 1)
+        summary_bottom = ctx - summary_suffix.len - summary_budget - 1;
+    summary_bottom = agent_compact_image_boundary(w->images, w->image_count,
+                        ds4_engine_is_glm_dsa(w->engine), summary_bottom);
+    if (summary_bottom <= sys.len) {
+        snprintf(err, err_len, "context too small to summarize this conversation; use a larger --ctx");
+        ds4_tokens_free(&summary_suffix);
+        ds4_tokens_free(&sys);
+        return false;
+    }
+    /* A full restored session may have no summary room. Summarize a bounded
+     * prefix and retain EVERY unsummarized token verbatim in the new tail. */
+    ds4_tokens prompt = {0};
+    agent_tokens_append_range(&prompt, &w->transcript, 0, summary_bottom);
+    agent_tokens_append_range(&prompt, &summary_suffix, 0, summary_suffix.len);
+    ds4_tokens_free(&summary_suffix);
+    size_t summary_images = 0;
+    while (summary_images < w->image_count &&
+           (uint64_t)w->images[summary_images].token_start +
+             w->images[summary_images].embedding.token_count <= (uint64_t)summary_bottom)
+        summary_images++;
+    agent_trace(w, "compaction summary prefix=%d total=%d retained_unsummarized=%d",
+                summary_bottom, bottom, bottom - summary_bottom);
+
+    pthread_mutex_lock(&w->mu);
+    w->status.state = AGENT_WORKER_COMPACTING;
+    w->progress_direct = false;
+    w->progress_started_at = now_sec();
+    w->status.prefill_done = 0;
+    w->status.prefill_total = 0;
+    w->status.prefill_tps = 0.0;
+    w->status.generated = 0;
+    w->status.gen_tps = 0.0;
+    w->status.greedy_sampling = false;
+    agent_wake_locked(w);
+    srv_status_publish_locked(w, true);
+    pthread_mutex_unlock(&w->mu);
+
+    int summary_room = agent_worker_effective_ctx_size(w) - prompt.len - 1;
+    if (summary_room < 256) {
+        snprintf(err, err_len, "not enough context left to request compaction summary");
+        ds4_tokens_free(&prompt);
+        ds4_tokens_free(&sys);
+        return false;
+    }
+    int summary_max = summary_room < summary_budget ? summary_room : summary_budget;
+
+    ds4_session_set_progress(w->session, worker_progress_cb, w);
+    ds4_session_set_display_progress(w->session, worker_progress_cb, w);
+    ds4_session_set_cancel(w->session, worker_cancel_session_cb, w);
+    int sync_rc;
+    if (summary_images) {
+        sync_rc = ds4_session_sync_multimodal(w->session, &prompt,
+                                              w->images, summary_images,
+                                              err, err_len);
+    } else {
+        sync_rc = ds4_session_sync(w->session, &prompt, err, err_len);
+    }
+    ds4_session_set_cancel(w->session, NULL, NULL);
+    ds4_session_set_progress(w->session, NULL, NULL);
+    ds4_session_set_display_progress(w->session, NULL, NULL);
+    if (sync_rc == DS4_SESSION_SYNC_INTERRUPTED) {
+        ds4_session_invalidate(w->session);
+        snprintf(err, err_len, "interrupted");
+        agent_publish_system_status(
+            w, "Compaction interrupted; keeping the previous conversation state.");
+        ds4_tokens_free(&prompt);
+        ds4_tokens_free(&sys);
+        worker_clear_interrupt(w);
+        return false;
+    }
+    if (sync_rc != 0) {
+        ds4_session_invalidate(w->session);
+        ds4_tokens_free(&prompt);
+        ds4_tokens_free(&sys);
+        return false;
+    }
+
+    /* From here until the final rebuild, the live KV contains the internal
+     * compaction prompt/summary, while w->transcript still contains the real
+     * conversation.  If anything fails, invalidate live KV so the next turn
+     * cannot accidentally continue from the private compaction exchange. */
+    agent_buf summary = {0};
+    char eval_err[160] = {0};
+    int dsml_id = agent_special_token_id(w->engine, "｜DSML｜");
+    double t0 = now_sec();
+    for (int i = 0; i < summary_max; i++) {
+        if (worker_should_interrupt(w)) {
+            snprintf(err, err_len, "interrupted");
+            ds4_session_invalidate(w->session);
+            ds4_tokens_free(&prompt);
+            ds4_tokens_free(&sys);
+            free(summary.ptr);
+                agent_publish_system_status(
+                w, "Compaction interrupted; keeping the previous conversation state.");
+            worker_clear_interrupt(w);
+            return false;
+        }
+        int token = ds4_session_argmax(w->session);
+        if (ds4_token_is_stop_for_think_mode(w->engine,
+                                             token,
+                                             DS4_THINK_NONE) ||
+            token == dsml_id) {
+            if (token == dsml_id && summary.len && summary.ptr[summary.len - 1] == '<') {
+                summary.ptr[--summary.len] = '\0';
+            }
+            agent_trace(w, "compaction summary stopped before control token id=%d", token);
+            break;
+        }
+        if (ds4_session_eval(w->session, token, eval_err, sizeof(eval_err)) != 0) {
+            snprintf(err, err_len, "%s", eval_err);
+            ds4_session_invalidate(w->session);
+            ds4_tokens_free(&prompt);
+            ds4_tokens_free(&sys);
+            free(summary.ptr);
+                return false;
+        }
+
+        size_t text_len = 0;
+        char *text = ds4_token_text(w->engine, token, &text_len);
+        agent_buf_append(&summary, text, text_len);
+        srv_summary_emit(w, text, text_len);
+        free(text);
+
+        double dt = now_sec() - t0;
+        pthread_mutex_lock(&w->mu);
+        w->status.generated = i + 1;
+        w->status.gen_tps = dt > 0.0 ? (double)(i + 1) / dt : 0.0;
+        w->status.greedy_sampling = false;
+        agent_wake_locked(w);
+        pthread_mutex_unlock(&w->mu);
+    }
+    ds4_tokens_free(&prompt);
+
+    if (!summary.ptr || !summary.ptr[0]) {
+        snprintf(err, err_len, "compaction summary was empty");
+        ds4_session_invalidate(w->session);
+        ds4_tokens_free(&sys);
+        free(summary.ptr);
+        return false;
+    }
+
+    agent_trace_text(w, "compaction-summary", summary.ptr, summary.len);
+    int tail_start = agent_compact_tail_start(w, bottom, sys.len);
+    if (tail_start > summary_bottom) tail_start = summary_bottom;
+    tail_start = agent_compact_image_boundary(w->images, w->image_count,
+                    ds4_engine_is_glm_dsa(w->engine), tail_start);
+    ds4_tokens compacted = {0};
+    ds4_tokens_copy(&compacted, &sys);
+
+    agent_buf summary_msg = {0};
+    agent_buf_puts(&summary_msg,
+        "\n\n[ds4-agent compacted earlier conversation. Durable task-state summary follows.]\n");
+    agent_buf_puts(&summary_msg, summary.ptr);
+    if (summary_msg.len && summary_msg.ptr[summary_msg.len - 1] != '\n')
+        agent_buf_puts(&summary_msg, "\n");
+    agent_buf_puts(&summary_msg, "[End compacted summary. Recent conversation continues verbatim below.]\n\n");
+    ds4_chat_append_message(w->engine, &compacted, "user", summary_msg.ptr);
+    free(summary_msg.ptr);
+    free(summary.ptr);
+
+    int resumed_start = -1;
+    /* Generation resumes inside the SAME assistant message, including any
+     * partial word or code line. A synthetic user request to "continue" can
+     * make the model skip the unfinished fragment or start a different task. */
+    if (open_assistant && tail_start > *open_assistant) {
+        int think_start = agent_special_token_id(w->engine, "<think>");
+        int think_end = agent_special_token_id(w->engine, "</think>");
+        bool in_think = false;
+        for (int i = *open_assistant; i < tail_start; i++) {
+            if (w->transcript.v[i] == think_start) in_think = true;
+            if (w->transcript.v[i] == think_end) in_think = false;
+        }
+        resumed_start = compacted.len;
+        ds4_chat_append_assistant_prefix(w->engine, &compacted,
+            in_think ? DS4_THINK_HIGH : DS4_THINK_NONE);
+    } else if (tail_start < bottom &&
+        w->transcript.v[tail_start] != ds4_token_user(w->engine) &&
+        w->transcript.v[tail_start] != ds4_token_assistant(w->engine)) {
+        ds4_chat_append_message(w->engine, &compacted, "user",
+            "[Verbatim tail of the previous conversation; it may begin mid-message.]\n");
+    }
+    const int tail_dst_start = compacted.len;
+    if (open_assistant && resumed_start < 0)
+        resumed_start = tail_dst_start + *open_assistant - tail_start;
+    agent_tokens_append_range(&compacted, &w->transcript, tail_start, bottom);
+    agent_trace_tokens(w, "compacted_transcript", &compacted, 0);
+    if (compacted.len >= ctx - agent_compact_reserve_tokens(w) - 128) {
+        snprintf(err, err_len, "compacted conversation leaves no working room; use a larger --ctx");
+        ds4_tokens_free(&compacted);
+        ds4_tokens_free(&sys);
+        ds4_session_invalidate(w->session);
+        return false;
+    }
+
+    ds4_vision_span *old_images = w->images;
+    size_t old_image_count = w->image_count;
+    size_t old_image_cap = w->image_cap;
+    ds4_vision_span *new_images = old_image_count ?
+        xmalloc(old_image_count * sizeof(new_images[0])) : NULL;
+    bool *kept_images = old_image_count ?
+        calloc(old_image_count, sizeof(kept_images[0])) : NULL;
+    if (old_image_count && !kept_images) {
+        free(new_images);
+        ds4_tokens_free(&compacted);
+        ds4_tokens_free(&sys);
+        ds4_session_invalidate(w->session);
+        snprintf(err, err_len, "out of memory retaining compacted images");
+        return false;
+    }
+    size_t new_image_count = 0;
+    for (size_t i = 0; i < old_image_count; i++) {
+        uint64_t image_end = (uint64_t)old_images[i].token_start +
+                             old_images[i].embedding.token_count;
+        if (old_images[i].token_start >= (uint32_t)tail_start &&
+            image_end <= (uint64_t)bottom) {
+            new_images[new_image_count] = old_images[i];
+            new_images[new_image_count].token_start =
+                (uint32_t)(tail_dst_start +
+                           (int)old_images[i].token_start - tail_start);
+            new_image_count++;
+            kept_images[i] = true;
+        }
+    }
+
+    agent_publishf_system_status(w,
+        "COMPACTING rebuilding context: old=%d summary+tail=%d tail=%d",
+        bottom, compacted.len, bottom - tail_start);
+
+    ds4_tokens old_transcript = {0};
+    ds4_tokens_copy(&old_transcript, &w->transcript);
+    ds4_tokens_free(&w->transcript);
+    w->transcript = compacted;
+    w->images = new_images;
+    w->image_count = new_image_count;
+    w->image_cap = old_image_count;
+    if (agent_worker_sync_tokens(w, &w->transcript, true, err, err_len) != 0) {
+        ds4_session_invalidate(w->session);
+        ds4_tokens_free(&w->transcript);
+        w->transcript = old_transcript;
+        free(new_images);
+        w->images = old_images;
+        w->image_count = old_image_count;
+        w->image_cap = old_image_cap;
+        free(kept_images);
+        ds4_tokens_free(&sys);
+        return false;
+    }
+    for (size_t i = 0; i < old_image_count; i++) {
+        if (!kept_images[i])
+            ds4_vision_embedding_free(&old_images[i].embedding);
+    }
+    free(old_images);
+    free(kept_images);
+    pthread_mutex_lock(&w->mu);
+    agent_hints_compacted(&w->hints);
+    pthread_mutex_unlock(&w->mu);
+    agent_worker_note_system_prompt_seen(w);
+    ds4_tokens_free(&old_transcript);
+    ds4_tokens_free(&sys);
+    /* Do not round-trip while a response is still being emitted. Otherwise ask
+     * the client to drain its prompt queue (it prepends any live bash-job note,
+     * Risk 7b); a non-empty reply is committed as a tool message. */
+    if (!open_assistant) {
+        char *drain = worker_request_queued_user_drain(w);
+        if (drain && drain[0]) {
+            ds4_chat_append_message(w->engine, &w->transcript, "tool", drain);
+            w->session_dirty = true;
+            agent_trace_text(w, "tool-after-compaction", drain, strlen(drain));
+        }
+        free(drain);
+    }
+    agent_trace(w, "compacted reason=\"%s\" old=%d new=%d tail_start=%d tail=%d",
+                reason ? reason : "", bottom, w->transcript.len,
+                tail_start, bottom - tail_start);
+    if (open_assistant) *open_assistant = resumed_start;
+    pthread_mutex_lock(&w->mu);
+    srv_status_publish_locked(w, true);
+    pthread_mutex_unlock(&w->mu);
+    return true;
+}
+
+static bool agent_worker_compact(agent_worker *w, const char *reason,
+                                  char *err, size_t err_len) {
+    return agent_worker_compact_transcript(w, reason, NULL, err, err_len);
+}
+
+static bool agent_worker_compact_if_needed(agent_worker *w, const char *reason,
+                                           char *err, size_t err_len) {
+    if (!agent_worker_should_compact(w)) return true;
+    return agent_worker_compact(w, reason, err, err_len);
+}
+
 
 static int worker_run_turn(agent_worker *w, const char *user_text) {
     server_config *cfg = w->cfg;

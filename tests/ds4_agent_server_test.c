@@ -706,6 +706,68 @@ static void test_turn_emit_stream(void) {
     fake_worker_destroy(&w);
 }
 
+/* ---- T6c: compaction boundary math + SUMMARY/SYSTEM streams ----------- */
+
+static void test_compact_tail_boundary(void) {
+    /* transcript: [sys...][user@40 ...][user@75 ...], bottom 100, sys_len 20 */
+    int v[100];
+    for (int i = 0; i < 100; i++) v[i] = 1;
+    const int USER = 7;
+    v[40] = USER;
+    v[75] = USER;
+    ds4_tokens t = { .v = v, .len = 100, .cap = 100 };
+
+    /* budget 30 -> target 70; the scan back finds the user turn at 75 */
+    CHECK(agent_compact_tail_boundary(&t, 100, 20, 30, USER) == 75);
+    /* budget 10 -> target 90, earliest 80; no user in [80,100) -> target 90 */
+    CHECK(agent_compact_tail_boundary(&t, 100, 20, 10, USER) == 90);
+    /* no user marker -> plain target */
+    CHECK(agent_compact_tail_boundary(&t, 100, 20, 30, -1) == 70);
+    /* target clamped to sys_len */
+    CHECK(agent_compact_tail_boundary(&t, 100, 60, 80, -1) == 60);
+}
+
+static void test_compact_image_boundary(void) {
+    ds4_vision_span sp = {0};
+    sp.token_start = 100;
+    sp.embedding.token_count = 50; /* image occupies [100, 150) */
+
+    CHECK(agent_compact_image_boundary(&sp, 1, false, 120) == 100); /* inside -> snap to start */
+    CHECK(agent_compact_image_boundary(&sp, 1, false, 200) == 200); /* after -> unchanged */
+    CHECK(agent_compact_image_boundary(&sp, 1, false, 40) == 40);   /* before -> unchanged */
+    CHECK(agent_compact_image_boundary(&sp, 1, true, 120) == 99);   /* glm wrapper token */
+    CHECK(agent_compact_image_boundary(&sp, 0, false, 120) == 120); /* no images */
+}
+
+static void test_compact_summary_and_banner_streams(void) {
+    agent_worker w;
+    fake_worker(&w);
+
+    agent_publishf_system_status(&w, "COMPACTING (%s): summarizing", "tool result would exceed context");
+    srv_summary_emit(&w, "user wants X; ", 14);
+    srv_summary_emit(&w, "file Y edited", 13);
+
+    /* one SYSTEM banner, then the two SUMMARY chunks coalesced */
+    CHECK(fifo_count(&w) == 2);
+
+    ap_reader r;
+    ap_reader_init(&r, w.fifo_head->body.data, w.fifo_head->body.len);
+    ap_stream s;
+    CHECK(ap_decode_stream(&r, &s));
+    CHECK(s.kind == AGENT_STREAM_SYSTEM);
+    CHECK(memmem(s.text, s.text_len,
+                 "COMPACTING (tool result would exceed context): summarizing",
+                 57) != NULL);
+
+    ap_reader_init(&r, w.fifo_head->next->body.data, w.fifo_head->next->body.len);
+    CHECK(ap_decode_stream(&r, &s));
+    CHECK(s.kind == AGENT_STREAM_SUMMARY);
+    CHECK(s.text_len == 27 &&
+          memcmp(s.text, "user wants X; file Y edited", 27) == 0);
+
+    fake_worker_destroy(&w);
+}
+
 int main(void) {
     test_parse_defaults();
     test_parse_engine_flags();
@@ -731,6 +793,9 @@ int main(void) {
     test_tool_exec_interrupt();
     test_drain_handshake();
     test_turn_emit_stream();
+    test_compact_tail_boundary();
+    test_compact_image_boundary();
+    test_compact_summary_and_banner_streams();
 
     if (failures) {
         fprintf(stderr, "%d agent server test(s) failed\n", failures);
