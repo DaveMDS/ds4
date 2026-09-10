@@ -498,6 +498,12 @@ typedef struct srv_msg {
     bool status_forced; /* STATUS only: a transition/error, never coalesced away */
 } srv_msg;
 
+/* Raw image bytes carried across the tool-exec handshake (owned copies). */
+typedef struct {
+    uint8_t *bytes;
+    size_t len;
+} srv_wire_image;
+
 /* Trimmed copy of ds4_agent.c's agent_worker: no web, bash, more-cursor,
  * linenoise or raw-mode fields (those live on the client). */
 typedef struct {
@@ -554,6 +560,17 @@ typedef struct {
     bool out_writer_stop;  /* the connection handler asks the writer to finish */
     uint32_t stream_seq;   /* monotonic STREAM stream_id within a connection */
     double last_status_enq; /* now_sec() of the last non-coalesced STATUS */
+
+    /* Tool-exec handshake (T6b): the worker suspends the turn in
+     * worker_request_tool_exec while the client runs the tools; the reader
+     * thread delivers the result through worker_answer_tool_exec. */
+    bool tool_exec_pending;
+    bool tool_exec_answered;
+    uint32_t tool_exec_request_id;
+    char **tool_result_parts;              /* owned copies from TOOL_RESULT */
+    size_t tool_result_part_count;
+    srv_wire_image *tool_result_images;    /* owned copies from TOOL_RESULT */
+    size_t tool_result_image_count;
 } agent_worker;
 
 typedef struct {
@@ -589,6 +606,10 @@ static void srv_fifo_clear_locked(agent_worker *w);
 static void srv_status_publish_locked(agent_worker *w, bool forced);
 static void srv_fifo_push_stream_locked(agent_worker *w, uint32_t kind,
                                         const char *text, size_t len);
+
+/* Turn-suspend handshakes: the reader thread wakes the worker (T6b section). */
+static void worker_answer_tool_exec(agent_worker *w, const ap_tool_result *tr);
+static void worker_answer_queued_user_drain(agent_worker *w, char *text);
 
 /* -- syntax helpers, effective ctx / think mode ------------------------- */
 
@@ -1968,6 +1989,9 @@ static int worker_status_power_locked(agent_worker *w) {
 static void worker_interrupt(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
     w->interrupt = true;
+    /* Wake the worker if it is suspended in a tool-exec / drain handshake so
+     * it can unwind the turn (T6b). */
+    pthread_cond_signal(&w->cond);
     if (w->cfg &&
         w->cfg->engine.distributed.role == DS4_DISTRIBUTED_COORDINATOR &&
         (w->status.state == AGENT_WORKER_PREFILL ||
@@ -2038,16 +2062,9 @@ static bool worker_is_initialized(agent_worker *w, agent_status *status) {
     return initialized;
 }
 
-/* -- T5/T6/T7 stubs: turn loop, deferred save + compaction ---- */
+/* -- turn loop (defined in the T6b section) + T7 deferred stubs ---- */
 
-static void worker_run_turn(agent_worker *w, const char *text) {
-    (void)text;
-    /* T5 adds the DSML/GLM parser + STREAM fragment emitter; T6 the turn
-     * loop with tool suspend/resume and mid-turn compaction. Until then a
-     * submitted turn just returns to IDLE. */
-    agent_trace(w, "worker_run_turn: turn execution not wired yet (T5/T6)");
-    agent_set_status(w, AGENT_WORKER_IDLE);
-}
+static int worker_run_turn(agent_worker *w, const char *user_text);
 
 static void worker_run_deferred_save(agent_worker *w) {
     if (!worker_take_save_requested(w)) return;
@@ -2216,6 +2233,12 @@ static void agent_worker_free(agent_worker *w) {
     if (w->wake_fd[1] >= 0) close(w->wake_fd[1]);
     free(w->cmd_text);
     free(w->out);
+    for (size_t i = 0; i < w->tool_result_part_count; i++)
+        free(w->tool_result_parts[i]);
+    free(w->tool_result_parts);
+    for (size_t i = 0; i < w->tool_result_image_count; i++)
+        free(w->tool_result_images[i].bytes);
+    free(w->tool_result_images);
     srv_fifo_clear_locked(w); /* worker + writer threads are joined by now */
     pthread_cond_destroy(&w->out_cond);
     pthread_cond_destroy(&w->cond);
@@ -3774,7 +3797,11 @@ static srv_dispatch_result srv_dispatch_frame(srv_conn_ctx *c, uint32_t type,
     case AGENT_MSG_TURN: {
         ap_turn t;
         if (!ap_decode_turn(&r, &t)) return SRV_DISPATCH_CLOSE;
-        /* Inline images (TURN.images[]) are wired in T6b. */
+        /* Attachments in a user turn (TURN.images[]) are not built into a
+         * multimodal user message yet; view_image is the supported path. */
+        if (t.image_count)
+            agent_trace(w, "reader: TURN carried %u image(s); dropped (use view_image)",
+                        t.image_count);
         char *text = xstrndup(t.text ? t.text : "", t.text_len);
         bool ok = worker_submit(w, text);
         free(text);
@@ -3801,11 +3828,20 @@ static srv_dispatch_result srv_dispatch_frame(srv_conn_ctx *c, uint32_t type,
     case AGENT_MSG_SESSION:
         return srv_dispatch_session(c, &r);
 
-    case AGENT_MSG_TOOL_RESULT:
-    case AGENT_MSG_DRAIN_REPLY:
-        agent_trace(w, "reader: %s ignored (handshakes land in T6b)",
-                    ap_msg_name(type));
+    case AGENT_MSG_TOOL_RESULT: {
+        ap_tool_result tr;
+        if (!ap_decode_tool_result(&r, &tr)) return SRV_DISPATCH_CLOSE;
+        worker_answer_tool_exec(w, &tr);
         return SRV_DISPATCH_CONTINUE;
+    }
+
+    case AGENT_MSG_DRAIN_REPLY: {
+        ap_drain_reply d;
+        if (!ap_decode_drain_reply(&r, &d)) return SRV_DISPATCH_CLOSE;
+        char *text = (d.text && d.text_len) ? xstrndup(d.text, d.text_len) : NULL;
+        worker_answer_queued_user_drain(w, text);
+        return SRV_DISPATCH_CONTINUE;
+    }
 
     case AGENT_MSG_HELLO:
         return SRV_DISPATCH_CLOSE; /* HELLO only at connect time */
@@ -3878,6 +3914,1184 @@ static void *srv_reader_main(void *arg) {
     pthread_cond_signal(&w->out_cond);
     pthread_mutex_unlock(&w->mu);
     return NULL;
+}
+
+/* ========================================================================= */
+/* T6b: turn loop, tool-exec / drain handshakes, vision.                      */
+/*                                                                            */
+/* worker_run_turn is rewritten: the painting agent_token_renderer is gone    */
+/* (the client paints), the exact/anchored edit forcer is gone (plan 3b), the */
+/* agent_execute_tool_observation is replaced by worker_request_tool_exec --  */
+/* the worker emits TOOL_CALLS, suspends the turn, and resumes when the       */
+/* reader thread delivers a TOOL_RESULT. Compaction is still stubbed (T6c).   */
+/* Everything else is copied from ds4_agent.c.                                 */
+/* ========================================================================= */
+
+/* -- extra system-message helpers skipped in T4 -------------------- */
+
+static const char agent_dsml_syntax_reminder[] =
+    "DSML syntax reminder:\n"
+    "<｜DSML｜tool_calls>\n"
+    "<｜DSML｜invoke name=\"$TOOL_NAME\">\n"
+    "<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n"
+    "</｜DSML｜invoke>\n"
+    "</｜DSML｜tool_calls>\n";
+
+static const char agent_glm_syntax_reminder[] =
+    "GLM tool-call syntax reminder:\n"
+    "<tool_call>$TOOL_NAME<arg_key>$PARAMETER_NAME</arg_key>"
+    "<arg_value>$PARAMETER_VALUE</arg_value></tool_call>\n";
+
+#define AGENT_SYSTEM_PROMPT_REMINDER_TOKENS 50000
+
+static const char agent_hints_prompt[] =
+    "The user enabled programming hints. Occasionally explain a useful concept "
+    "behind the current work: a design choice, failure mechanism, trade-off, "
+    "or way to verify correctness. Base each hint on code or results you have "
+    "actually examined. Write one or two sentences as a normal Markdown "
+    "blockquote starting with > **Hint:**. Hints are prose, not tool calls. "
+    "Put them after the relevant discovery, including between tool calls. "
+    "Prefer no hint to routine narration, repetition, or generic advice. "
+    "Do not invent personal experience or a learner profile. Keep working "
+    "without waiting for an answer. Later system notes may enable or disable "
+    "hints; follow the latest setting.\n";
+
+static const char *agent_hints_note(agent_hints *h) {
+    const char *note;
+    if (h->enabled && !h->instructed) {
+        note = agent_hints_prompt;
+        h->instructed = true;
+    } else if (h->applied != AGENT_HINTS_UNSET &&
+               h->applied != (h->enabled ? AGENT_HINTS_ON : AGENT_HINTS_OFF)) {
+        note = h->enabled ?
+            "The user enabled programming hints. Produce them from now on.\n" :
+            "Programming hints are disabled. Do not produce teaching asides; "
+            "continue the task normally.\n";
+    } else {
+        return NULL;
+    }
+    h->applied = h->enabled ? AGENT_HINTS_ON : AGENT_HINTS_OFF;
+    return note;
+}
+
+static void agent_hints_compacted(agent_hints *h) {
+    /* The retained tail may still contain an old on/off note. */
+    if (h->applied != AGENT_HINTS_UNSET) h->applied = AGENT_HINTS_UNKNOWN;
+    h->instructed = false;
+}
+
+static void agent_worker_append_hints_context(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    const char *note = agent_hints_note(&w->hints);
+    pthread_mutex_unlock(&w->mu);
+    if (!note) return;
+    ds4_chat_append_message(w->engine, &w->transcript, "system", note);
+    agent_trace_text(w, "hints-context", note, strlen(note));
+    pthread_mutex_lock(&w->mu);
+    w->session_dirty = true;
+    pthread_mutex_unlock(&w->mu);
+}
+
+static char *agent_build_system_prompt_reminder(ds4_engine *engine) {
+    char *tools = agent_build_tools_prompt(engine);
+    const char *start = "\n\n[System prompt reminder follows.]\n";
+    const char *end = "[End system prompt reminder.]\n\n";
+    const size_t len = strlen(start) + strlen(tools) + strlen(end) + 1;
+    char *out = xmalloc(len);
+    snprintf(out, len, "%s%s%s", start, tools, end);
+    free(tools);
+    return out;
+}
+
+static void agent_worker_maybe_append_datetime_context(agent_worker *w) {
+    if (w->datetime_context_injected) return;
+
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+
+    char when[128];
+    if (strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S %Z", &tm) == 0)
+        snprintf(when, sizeof(when), "%lld", (long long)now);
+
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "Current local date and time at session start: %s. "
+             "Use this only when date or time matters.", when);
+    ds4_chat_append_message(w->engine, &w->transcript, "system", msg);
+    agent_trace_text(w, "datetime-context", msg, strlen(msg));
+    w->datetime_context_injected = true;
+}
+
+
+static void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w) {
+    if (w->last_system_prompt_reminder_at <= 0) {
+        agent_worker_note_system_prompt_seen(w);
+        return;
+    }
+    if (w->transcript.len - w->last_system_prompt_reminder_at <
+        AGENT_SYSTEM_PROMPT_REMINDER_TOKENS) {
+        return;
+    }
+
+    char *reminder = agent_build_system_prompt_reminder(w->engine);
+    agent_publish_system_status(w, "Re-injecting system prompt reminder...");
+    agent_trace(w, "system prompt reminder injected at transcript=%d",
+                w->transcript.len);
+    if (agent_tool_syntax_for_engine(w->engine) == AGENT_TOOL_SYNTAX_GLM) {
+        ds4_chat_append_message(w->engine, &w->transcript, "system", reminder);
+    } else {
+        ds4_tokenize_rendered_chat(w->engine, reminder, &w->transcript);
+    }
+    free(reminder);
+
+    if (w->cfg->gen.system && w->cfg->gen.system[0]) {
+        ds4_chat_append_message(w->engine, &w->transcript, "system",
+                                w->cfg->gen.system);
+    }
+    agent_worker_note_system_prompt_seen(w);
+}
+
+
+/* -- read/compaction reserve sizing ------------------------------ */
+
+#define AGENT_READ_DEFAULT_LINES_SMALL 120
+#define AGENT_READ_DEFAULT_LINES_MEDIUM 240
+#define AGENT_READ_DEFAULT_LINES_LARGE 500
+#define AGENT_READ_SMALL_CONTEXT_MAX 8192
+#define AGENT_READ_MEDIUM_CONTEXT_MAX 16384
+#define AGENT_TOOL_RESULT_RESERVE_TOKENS 1024
+
+static int agent_compact_reserve_tokens(agent_worker *w) {
+    char *text = agent_compact_make_prompt("context pressure before continuing the current task");
+    ds4_tokens tokens = {0};
+    ds4_chat_append_message(w->engine, &tokens, "user", text);
+    ds4_chat_append_assistant_prefix(w->engine, &tokens, DS4_THINK_NONE);
+    int reserve = tokens.len + 64 +
+                  agent_compact_summary_budget(agent_worker_effective_ctx_size(w));
+    free(text);
+    ds4_tokens_free(&tokens);
+    return reserve;
+}
+
+static int agent_tool_result_reserve_tokens(agent_worker *w) {
+    int ctx = agent_worker_effective_ctx_size(w);
+    int reserve = AGENT_TOOL_RESULT_RESERVE_TOKENS;
+    if (ctx > 0) {
+        int proportional = ctx / 8;
+        if (proportional < 16) proportional = 16;
+        if (reserve > proportional) reserve = proportional;
+    }
+    int compact = agent_compact_reserve_tokens(w) + 128;
+    return reserve > compact ? reserve : compact;
+}
+
+static int agent_read_default_lines(agent_worker *w) {
+    int ctx = agent_worker_effective_ctx_size(w);
+    if (ctx > 0 && ctx <= AGENT_READ_SMALL_CONTEXT_MAX)
+        return AGENT_READ_DEFAULT_LINES_SMALL;
+    if (ctx > 0 && ctx <= AGENT_READ_MEDIUM_CONTEXT_MAX)
+        return AGENT_READ_DEFAULT_LINES_MEDIUM;
+    return AGENT_READ_DEFAULT_LINES_LARGE;
+}
+
+
+/* -- compaction: stubbed until T6c ----------------------------- */
+
+static bool agent_worker_should_compact(agent_worker *w) { (void)w; return false; }
+static bool agent_worker_compact_transcript(agent_worker *w, const char *reason,
+                                            int *open_assistant,
+                                            char *err, size_t err_len) {
+    (void)w; (void)reason; (void)open_assistant; (void)err; (void)err_len;
+    return true; /* T6c */
+}
+static bool agent_worker_compact(agent_worker *w, const char *reason,
+                                 char *err, size_t err_len) {
+    (void)w; (void)reason; (void)err; (void)err_len;
+    return true; /* T6c */
+}
+static bool agent_worker_compact_if_needed(agent_worker *w, const char *reason,
+                                           char *err, size_t err_len) {
+    (void)w; (void)reason; (void)err; (void)err_len;
+    return true; /* T6c */
+}
+
+/* -- user message append + rewind ----------------------------- */
+
+static bool agent_worker_append_user(agent_worker *w, const char *text,
+                                     char *err, size_t err_len) {
+    ds4_tokens message = {0}, sys = {0};
+    ds4_chat_append_message(w->engine, &message, "user", text);
+    agent_worker_build_system_tokens(w, &sys);
+    int ctx = agent_worker_effective_ctx_size(w);
+    bool ok = message.len < ctx - sys.len - 4;
+    ds4_tokens_free(&sys);
+    if (!ok) {
+        snprintf(err, err_len, "user message is too large for --ctx %d; use a larger context or a smaller message", ctx);
+    } else if (message.len >= ctx - w->transcript.len - 4) {
+        ok = agent_worker_compact(w, "make room for incoming user message", err, err_len);
+        if (ok && message.len >= ctx - w->transcript.len - 4) {
+            snprintf(err, err_len, "user message does not fit after compaction; use a larger --ctx");
+            ok = false;
+        }
+    }
+    if (ok) agent_tokens_append_range(&w->transcript, &message, 0, message.len);
+    ds4_tokens_free(&message);
+    return ok;
+}
+
+static int agent_worker_rewind(agent_worker *w, int pos,
+                               char *err, size_t err_len) {
+    ds4_session_rewind(w->session, pos);
+    ds4_tokens prefix = {0};
+    ds4_tokens_copy(&prefix, ds4_session_tokens(w->session));
+    int rc = 0;
+    if (ds4_session_common_prefix(w->session, &prefix) != prefix.len) {
+        rc = agent_worker_sync_tokens(w, &prefix, false, err, err_len);
+    }
+    ds4_tokens_free(&prefix);
+    return rc;
+}
+
+/* -- tool observation buffers + multimodal build -------------- */
+
+typedef struct {
+    char *text;
+    size_t len;
+    size_t cap;
+} agent_tool_text_part;
+
+typedef struct {
+    agent_tool_text_part *parts;
+    size_t part_count;
+    size_t part_cap;
+    ds4_vision_embedding *images;
+    size_t image_count;
+    size_t image_cap;
+} agent_tool_observation;
+
+static void agent_tool_observation_init(agent_tool_observation *obs) {
+    memset(obs, 0, sizeof(*obs));
+    obs->parts = xmalloc(sizeof(obs->parts[0]));
+    memset(obs->parts, 0, sizeof(obs->parts[0]));
+    obs->part_count = 1;
+    obs->part_cap = 1;
+}
+
+static void agent_tool_observation_puts(agent_tool_observation *obs,
+                                        const char *text) {
+    if (!obs->part_count) agent_tool_observation_init(obs);
+    agent_tool_text_part *part = &obs->parts[obs->part_count - 1];
+    size_t n = text ? strlen(text) : 0;
+    if (part->len + n + 1 > part->cap) {
+        size_t cap = part->cap ? part->cap : 128;
+        while (cap < part->len + n + 1) cap *= 2;
+        part->text = xrealloc(part->text, cap);
+        part->cap = cap;
+    }
+    if (n) memcpy(part->text + part->len, text, n);
+    part->len += n;
+    part->text[part->len] = '\0';
+}
+
+static void agent_tool_observation_add_image(agent_tool_observation *obs,
+                                             ds4_vision_embedding *embedding) {
+    if (obs->image_count == obs->image_cap) {
+        size_t cap = obs->image_cap ? obs->image_cap * 2 : 2;
+        obs->images = xrealloc(obs->images, cap * sizeof(obs->images[0]));
+        obs->image_cap = cap;
+    }
+    obs->images[obs->image_count++] = *embedding;
+    memset(embedding, 0, sizeof(*embedding));
+    if (obs->part_count == obs->part_cap) {
+        size_t cap = obs->part_cap ? obs->part_cap * 2 : 2;
+        obs->parts = xrealloc(obs->parts, cap * sizeof(obs->parts[0]));
+        obs->part_cap = cap;
+    }
+    memset(&obs->parts[obs->part_count++], 0, sizeof(obs->parts[0]));
+}
+
+static void agent_tool_observation_free(agent_tool_observation *obs) {
+    if (!obs) return;
+    for (size_t i = 0; i < obs->part_count; i++) free(obs->parts[i].text);
+    for (size_t i = 0; i < obs->image_count; i++)
+        ds4_vision_embedding_free(&obs->images[i]);
+    free(obs->parts);
+    free(obs->images);
+    memset(obs, 0, sizeof(*obs));
+}
+
+static void agent_vision_spans_free(ds4_vision_span *spans, size_t count) {
+    if (!spans) return;
+    for (size_t i = 0; i < count; i++)
+        ds4_vision_embedding_free(&spans[i].embedding);
+    free(spans);
+}
+
+static bool agent_tool_observation_build(agent_worker *w,
+                                         const agent_tool_observation *obs,
+                                         ds4_tokens *tokens,
+                                         ds4_vision_span **spans_out,
+                                         char *err, size_t err_len) {
+    const char **parts = xmalloc(obs->part_count * sizeof(parts[0]));
+    for (size_t i = 0; i < obs->part_count; i++)
+        parts[i] = obs->parts[i].text ? obs->parts[i].text : "";
+    ds4_vision_embedding *images = NULL;
+    ds4_vision_span *spans = NULL;
+    if (obs->image_count) {
+        images = xmalloc(obs->image_count * sizeof(images[0]));
+        spans = xmalloc(obs->image_count * sizeof(spans[0]));
+        memset(images, 0, obs->image_count * sizeof(images[0]));
+        memset(spans, 0, obs->image_count * sizeof(spans[0]));
+        const int n_embd = ds4_engine_embd_dim(w->engine);
+        for (size_t i = 0; i < obs->image_count; i++) {
+            const ds4_vision_embedding *src = &obs->images[i];
+            if (!src->data || src->token_count == 0 || n_embd <= 0 ||
+                (uint64_t)src->token_count >
+                    SIZE_MAX / (uint64_t)n_embd / sizeof(float)) {
+                snprintf(err, err_len, "invalid image observation embedding");
+                for (size_t j = 0; j < i; j++)
+                    ds4_vision_embedding_free(&images[j]);
+                free(images);
+                free(spans);
+                free(parts);
+                ds4_tokens_free(tokens);
+                return false;
+            }
+            const size_t bytes = (size_t)src->token_count *
+                                 (size_t)n_embd * sizeof(float);
+            images[i] = *src;
+            images[i].data = malloc(bytes);
+            if (!images[i].data) {
+                snprintf(err, err_len, "unable to copy image observation embedding");
+                for (size_t j = 0; j <= i; j++)
+                    ds4_vision_embedding_free(&images[j]);
+                free(images);
+                free(spans);
+                free(parts);
+                ds4_tokens_free(tokens);
+                return false;
+            }
+            memcpy(images[i].data, src->data, bytes);
+        }
+    }
+    ds4_tokens_copy(tokens, &w->transcript);
+    /* GLM grounds image tokens in user turns; keep text-only observations in
+     * the native tool-response role used by the rest of the agent protocol. */
+    bool ok = ds4_chat_append_multimodal_message(
+        w->engine, tokens, obs->image_count ? "user" : "tool",
+        parts, images, obs->image_count, spans,
+        err, err_len) != 0;
+    free(parts);
+    if (!ok) {
+        for (size_t i = 0; i < obs->image_count; i++) {
+            ds4_vision_embedding_free(&images[i]);
+            ds4_vision_embedding_free(&spans[i].embedding);
+        }
+    }
+    free(images);
+    if (!ok) {
+        free(spans);
+        ds4_tokens_free(tokens);
+        return false;
+    }
+    *spans_out = spans;
+    return true;
+}
+
+/* -1 is a rendering/embedding error, not a request to compact the context. */
+static int agent_tool_observation_fits(agent_worker *w,
+                                        const agent_tool_observation *obs,
+                                        int reserve_tokens,
+                                        int *tokens_out,
+                                        char *err, size_t err_len) {
+    ds4_tokens tmp = {0};
+    ds4_vision_span *spans = NULL;
+    if (err_len) err[0] = '\0';
+    if (!agent_tool_observation_build(w, obs, &tmp, &spans,
+                                      err, err_len))
+        return -1;
+    int tokens = tmp.len;
+    ds4_tokens_free(&tmp);
+    agent_vision_spans_free(spans, obs->image_count);
+    if (tokens_out) *tokens_out = tokens;
+    int ctx = agent_worker_effective_ctx_size(w);
+    return ctx > 0 && tokens + reserve_tokens < ctx;
+}
+
+static bool agent_tool_observation_commit(agent_worker *w,
+                                          agent_tool_observation *obs,
+                                          char *err, size_t err_len) {
+    ds4_tokens next = {0};
+    ds4_vision_span *spans = NULL;
+    if (!agent_tool_observation_build(w, obs, &next, &spans, err, err_len))
+        return false;
+    ds4_tokens_free(&w->transcript);
+    w->transcript = next;
+    agent_worker_images_append(w, spans, obs->image_count);
+    free(spans);
+    return true;
+}
+
+/* -- sampling mode + generated-token plumbing ---------------- */
+
+static int worker_sample_with_mode(agent_worker *w, const server_config *cfg,
+                                   bool greedy, uint64_t *rng) {
+    return ds4_session_sample(w->session,
+                              greedy ? 0.0f : cfg->gen.temperature,
+                              0,
+                              greedy ? 1.0f : cfg->gen.top_p,
+                              greedy ? 0.0f : cfg->gen.min_p,
+                              rng);
+}
+
+static void worker_set_greedy_sampling(agent_worker *w, bool greedy) {
+    pthread_mutex_lock(&w->mu);
+    if (w->status.greedy_sampling != greedy) {
+        w->status.greedy_sampling = greedy;
+        agent_wake_locked(w);
+    }
+    pthread_mutex_unlock(&w->mu);
+}
+
+
+static int worker_finish_generated_token(agent_worker *w,
+                                         int token,
+                                         int *generated,
+                                         double t0,
+                                         srv_stream *stream,
+                                         bool evaluate,
+                                         char *err,
+                                         size_t err_len) {
+    ds4_tokens_push(&w->transcript, token);
+
+    size_t text_len = 0;
+    char *text = ds4_token_text(w->engine, token, &text_len);
+    agent_trace_token(w, token, text, text_len, *generated + 1);
+    srv_stream_text(stream, text, text_len, false);
+    free(text);
+    (*generated)++;
+
+    if (evaluate &&
+        ds4_session_eval(w->session, token, err, err_len) != 0) {
+        ds4_session_invalidate(w->session);
+        return 1;
+    }
+
+    double dt = now_sec() - t0;
+    pthread_mutex_lock(&w->mu);
+    w->status.generated = *generated;
+    w->status.gen_tps = dt > 0.0 ? (double)*generated / dt : 0.0;
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+    return 0;
+}
+
+static int worker_accept_generated_token(agent_worker *w,
+                                         int token,
+                                         int *generated,
+                                         double t0,
+                                         srv_stream *stream,
+                                         char *err,
+                                         size_t err_len) {
+    return worker_finish_generated_token(w, token, generated, t0, stream,
+                                         true, err, err_len);
+}
+
+static int worker_force_generated_text(agent_worker *w,
+                                       const char *text,
+                                       int max_tokens,
+                                       int *generated,
+                                       double t0,
+                                       srv_stream *stream,
+                                       char *err,
+                                       size_t err_len) {
+    ds4_tokens tokens = {0};
+    ds4_tokenize_text(w->engine, text, &tokens);
+    if (tokens.len > max_tokens - *generated) {
+        snprintf(err, err_len, "not enough generation room to force %s", text);
+        ds4_tokens_free(&tokens);
+        return 1;
+    }
+    for (int i = 0; i < tokens.len && *generated < max_tokens; i++) {
+        if (worker_accept_generated_token(w, tokens.v[i], generated, t0,
+                                          stream, err, err_len) != 0) {
+            ds4_tokens_free(&tokens);
+            return 1;
+        }
+    }
+    ds4_tokens_free(&tokens);
+    return 0;
+}
+
+/* -- turn-suspend handshakes: TOOL_CALLS/TOOL_RESULT, DRAIN --------- */
+
+static void srv_free_tool_result(char **parts, size_t np,
+                                 srv_wire_image *imgs, size_t ni) {
+    for (size_t i = 0; i < np; i++) free(parts[i]);
+    free(parts);
+    for (size_t i = 0; i < ni; i++) free(imgs[i].bytes);
+    free(imgs);
+}
+
+/* Reader thread: hand a decoded TOOL_RESULT to the suspended worker. The proto
+ * struct borrows from the frame payload, so every field is copied here. */
+static void worker_answer_tool_exec(agent_worker *w, const ap_tool_result *tr) {
+    pthread_mutex_lock(&w->mu);
+    if (!w->tool_exec_pending || w->tool_exec_answered ||
+        tr->request_id != w->tool_exec_request_id) {
+        pthread_mutex_unlock(&w->mu);
+        return;
+    }
+    srv_free_tool_result(w->tool_result_parts, w->tool_result_part_count,
+                         w->tool_result_images, w->tool_result_image_count);
+
+    size_t np = tr->text_part_count;
+    char **parts = xmalloc((np ? np : 1) * sizeof(parts[0]));
+    for (size_t i = 0; i < np; i++)
+        parts[i] = xstrndup(tr->text_parts[i].ptr ? tr->text_parts[i].ptr : "",
+                            tr->text_parts[i].len);
+
+    size_t ni = tr->image_count;
+    srv_wire_image *imgs = ni ? xmalloc(ni * sizeof(imgs[0])) : NULL;
+    for (size_t i = 0; i < ni; i++) {
+        imgs[i].len = tr->images[i].bytes_len;
+        imgs[i].bytes = xmalloc(imgs[i].len ? imgs[i].len : 1);
+        if (imgs[i].len) memcpy(imgs[i].bytes, tr->images[i].bytes, imgs[i].len);
+    }
+
+    w->tool_result_parts = parts;
+    w->tool_result_part_count = np;
+    w->tool_result_images = imgs;
+    w->tool_result_image_count = ni;
+    w->tool_exec_answered = true;
+    pthread_cond_signal(&w->cond);
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+}
+
+/* Worker thread: emit TOOL_CALLS, suspend the turn until the client answers
+ * with a TOOL_RESULT, then build the observation. On INTERRUPT / STOP it
+ * returns an empty observation with *interrupted set. */
+static agent_tool_observation worker_request_tool_exec(agent_worker *w,
+                                                       const agent_tool_calls *calls,
+                                                       bool *interrupted) {
+    agent_tool_observation obs;
+    agent_tool_observation_init(&obs);
+    *interrupted = false;
+
+    ap_tool_calls tc = {0};
+    tc.request_id = ++w->tool_exec_request_id;
+    for (int i = 0; i < calls->len && tc.call_count < AP_MAX_TOOL_CALLS; i++) {
+        const agent_tool_call *src = &calls->v[i];
+        ap_tool_call *dst = &tc.calls[tc.call_count++];
+        dst->name = src->name ? src->name : "";
+        dst->name_len = strlen(dst->name);
+        for (int a = 0; a < src->argc && dst->arg_count < AP_MAX_TOOL_ARGS; a++) {
+            ap_tool_arg *da = &dst->args[dst->arg_count++];
+            da->name = src->args[a].name ? src->args[a].name : "";
+            da->name_len = strlen(da->name);
+            da->value = src->args[a].value ? src->args[a].value : "";
+            da->value_len = strlen(da->value);
+            da->is_string = src->args[a].is_string;
+        }
+    }
+    ap_buf body;
+    ap_buf_init(&body);
+    ap_encode_tool_calls(&body, &tc);
+
+    pthread_mutex_lock(&w->mu);
+    w->tool_exec_pending = true;
+    w->tool_exec_answered = false;
+    srv_fifo_push_locked(w, AGENT_MSG_TOOL_CALLS, &body); /* moves body */
+    while (!w->stop && !w->interrupt && !w->tool_exec_answered)
+        pthread_cond_wait(&w->cond, &w->mu);
+    bool intr = w->stop || w->interrupt;
+    char **parts = w->tool_result_parts;
+    size_t npart = w->tool_result_part_count;
+    srv_wire_image *imgs = w->tool_result_images;
+    size_t nimg = w->tool_result_image_count;
+    w->tool_result_parts = NULL;
+    w->tool_result_part_count = 0;
+    w->tool_result_images = NULL;
+    w->tool_result_image_count = 0;
+    w->tool_exec_pending = false;
+    w->tool_exec_answered = false;
+    pthread_mutex_unlock(&w->mu);
+    ap_buf_free(&body);
+
+    if (intr) {
+        srv_free_tool_result(parts, npart, imgs, nimg);
+        *interrupted = true;
+        return obs;
+    }
+
+    for (size_t i = 0; i < npart; i++)
+        agent_tool_observation_puts(&obs, parts[i] ? parts[i] : "");
+    for (size_t i = 0; i < nimg; i++) {
+        ds4_vision_embedding emb = {0};
+        char err[256] = {0};
+        if (ds4_engine_vision_encode_memory(w->engine, imgs[i].bytes,
+                                            imgs[i].len, &emb,
+                                            err, sizeof(err))) {
+            agent_tool_observation_add_image(&obs, &emb);
+        } else {
+            agent_tool_observation_puts(&obs, "Tool error: image decode failed: ");
+            agent_tool_observation_puts(&obs, err[0] ? err : "unable to decode image");
+            agent_tool_observation_puts(&obs, "\n");
+        }
+    }
+    srv_free_tool_result(parts, npart, imgs, nimg);
+    return obs;
+}
+
+/* Reader thread: hand a DRAIN_REPLY (or NULL text) to the suspended worker. */
+static void worker_answer_queued_user_drain(agent_worker *w, char *text) {
+    pthread_mutex_lock(&w->mu);
+    if (!w->queued_user_drain_pending) {
+        pthread_mutex_unlock(&w->mu);
+        free(text);
+        return;
+    }
+    free(w->queued_user_drain_text);
+    w->queued_user_drain_text = text;
+    w->queued_user_drain_answered = true;
+    pthread_cond_signal(&w->cond);
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+}
+
+/* Worker thread: emit DRAIN_REQUEST and block for the client's DRAIN_REPLY. */
+static char *worker_request_queued_user_drain(agent_worker *w) {
+    ap_buf empty;
+    ap_buf_init(&empty);
+    pthread_mutex_lock(&w->mu);
+    w->queued_user_drain_pending = true;
+    w->queued_user_drain_answered = false;
+    free(w->queued_user_drain_text);
+    w->queued_user_drain_text = NULL;
+    srv_fifo_push_locked(w, AGENT_MSG_DRAIN_REQUEST, &empty);
+    agent_wake_locked(w);
+    while (!w->stop && !w->queued_user_drain_answered)
+        pthread_cond_wait(&w->cond, &w->mu);
+    char *text = w->queued_user_drain_text;
+    w->queued_user_drain_text = NULL;
+    w->queued_user_drain_pending = false;
+    w->queued_user_drain_answered = false;
+    pthread_mutex_unlock(&w->mu);
+    ap_buf_free(&empty);
+    return text;
+}
+
+/* srv_stream emit sink used by the turn loop: every classified fragment is a
+ * STREAM frame on the FIFO, sharing the connection's monotonic stream_id. */
+static void srv_turn_emit(void *ud, uint32_t stream_id, uint32_t kind,
+                          const char *text, size_t len) {
+    (void)stream_id;
+    agent_worker *w = ud;
+    pthread_mutex_lock(&w->mu);
+    srv_fifo_push_stream_locked(w, kind, text, len);
+    pthread_mutex_unlock(&w->mu);
+}
+
+static char *agent_session_title_from_prompt(const char *prompt, size_t max_bytes) {
+    const char *p = prompt ? prompt : "";
+    return agent_session_title_from_span(p, p + strlen(p), max_bytes,
+                                         "(empty user prompt)");
+}
+
+static int worker_run_turn(agent_worker *w, const char *user_text) {
+    server_config *cfg = w->cfg;
+    ds4_think_mode think_mode = effective_think_mode(cfg);
+    pthread_mutex_lock(&w->mu);
+    w->interrupt = false;
+    w->status.error[0] = '\0';
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+
+    char compact_err[160] = {0};
+    if (!agent_worker_compact_if_needed(w, "soft limit before user turn",
+                                        compact_err, sizeof(compact_err)))
+    {
+        if (agent_err_is_interrupted(compact_err)) {
+            worker_clear_interrupt(w);
+            agent_set_status(w, AGENT_WORKER_IDLE);
+            return 0;
+        }
+        agent_set_error(w, compact_err[0] ? compact_err : "context compaction failed");
+        return 1;
+    }
+    agent_worker_maybe_append_datetime_context(w);
+    agent_worker_append_hints_context(w);
+    agent_trace_text(w, "user", user_text ? user_text : "",
+                     user_text ? strlen(user_text) : 0);
+    if (!agent_worker_append_user(w, user_text, compact_err, sizeof(compact_err))) {
+        if (agent_err_is_interrupted(compact_err)) {
+            worker_clear_interrupt(w);
+            agent_set_status(w, AGENT_WORKER_IDLE);
+            return 0;
+        }
+        agent_set_error(w, compact_err);
+        return 1;
+    }
+    if (!w->session_title) {
+        w->session_title = agent_session_title_from_prompt(user_text, 0);
+        w->session_created_at = (uint64_t)time(NULL);
+        agent_session_identity_sha(w->session_title, w->session_created_at,
+                                   w->session_sha);
+    }
+
+    uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
+        ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
+    pthread_mutex_lock(&w->mu);
+    w->user_activity = true;
+    w->session_dirty = true;
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+
+    /* A user turn may contain any number of assistant/tool/assistant rounds.
+     * Coding agents naturally perform long read/edit/test loops, so there is
+     * deliberately no artificial "too many tool calls" ceiling here: context
+     * pressure, compaction, user Ctrl+C, and the model's final answer are the
+     * real stopping conditions.  The transcript is the single source of truth:
+     * after a DSML stanza completes we terminate that assistant message, append
+     * the tool result as a tool message, then ask the model to continue. */
+    int carried_generation = 0;
+    bool resume_assistant = false, resume_in_think = false;
+    int resume_start = 0;
+    for (int tool_round = 0; ; tool_round++) {
+        if (!resume_assistant &&
+            !agent_worker_compact_if_needed(w, "soft limit before assistant continuation",
+                                            compact_err, sizeof(compact_err)))
+        {
+            if (agent_err_is_interrupted(compact_err)) {
+                worker_clear_interrupt(w);
+                agent_set_status(w, AGENT_WORKER_IDLE);
+                return 0;
+            }
+            agent_set_error(w, compact_err[0] ? compact_err : "context compaction failed");
+            return 1;
+        }
+        if (!resume_assistant) {
+            agent_worker_maybe_append_system_prompt_reminder(w);
+            agent_worker_append_hints_context(w);
+        }
+        const int assistant_start = resume_assistant ? resume_start : w->transcript.len;
+        if (!resume_assistant)
+            ds4_chat_append_assistant_prefix(w->engine, &w->transcript, think_mode);
+
+        const ds4_tokens *prompt_for_sync = &w->transcript;
+        int old_pos = ds4_session_pos(w->session);
+        int common = ds4_session_common_prefix(w->session, &w->transcript);
+        int cached = common == old_pos && w->transcript.len >= old_pos ? common : 0;
+
+        int suffix = prompt_for_sync->len - cached;
+        agent_trace(w, "prefill tool_round=%d transcript=%d prompt=%d cached=%d suffix=%d think=%s",
+                    tool_round, w->transcript.len, prompt_for_sync->len,
+                    cached, suffix, ds4_think_mode_name(think_mode));
+        agent_trace_tokens(w, "prefill_suffix", prompt_for_sync, cached);
+
+        pthread_mutex_lock(&w->mu);
+        unsigned prefill_label = w->status.state == AGENT_WORKER_PREFILL ?
+            w->status.prefill_label : agent_next_prefill_label();
+        w->status.state = AGENT_WORKER_PREFILL;
+        w->progress_base = cached;
+        w->progress_direct = false;
+        w->progress_started_at = now_sec();
+        w->status.prefill_done = 0;
+        w->status.prefill_total = suffix;
+        w->status.prefill_label = prefill_label;
+        w->status.prefill_tps = 0.0;
+        w->status.generated = 0;
+        w->status.gen_tps = 0.0;
+        w->status.greedy_sampling = false;
+        agent_wake_locked(w);
+        pthread_mutex_unlock(&w->mu);
+
+        char err[160];
+        ds4_session_set_progress(w->session, worker_progress_cb, w);
+        ds4_session_set_display_progress(w->session, worker_progress_cb, w);
+        ds4_session_set_cancel(w->session, worker_cancel_session_cb, w);
+        double t_sync0 = now_sec();
+        int sync_rc = w->image_count ?
+            ds4_session_sync_multimodal(w->session, prompt_for_sync,
+                                        w->images, w->image_count,
+                                        err, sizeof(err)) :
+            ds4_session_sync(w->session, prompt_for_sync, err, sizeof(err));
+        double t_sync1 = now_sec();
+        ds4_session_set_cancel(w->session, NULL, NULL);
+        ds4_session_set_progress(w->session, NULL, NULL);
+        ds4_session_set_display_progress(w->session, NULL, NULL);
+        agent_trace(w, "prefill sync done tool_round=%d prompt=%d cached=%d suffix=%d rc=%d %.3f ms",
+                    tool_round, prompt_for_sync->len, cached, suffix,
+                    sync_rc, (t_sync1 - t_sync0) * 1000.0);
+        if (sync_rc == DS4_SESSION_SYNC_INTERRUPTED) {
+            agent_publish_system_status(
+                w, "Model reading interrupted; the model may only be aware of the prefix processed so far.");
+            agent_worker_append_assistant_turn_end(w);
+            worker_clear_interrupt(w);
+            agent_set_status(w, AGENT_WORKER_IDLE);
+            return 0;
+        }
+        if (sync_rc != 0) {
+            agent_set_error(w, err);
+            return 1;
+        }
+
+        int max_tokens = cfg->gen.n_predict - carried_generation;
+        int room = ds4_session_ctx(w->session) - ds4_session_pos(w->session);
+        int generation_room = room - agent_compact_reserve_tokens(w);
+        bool context_limited = generation_room < max_tokens;
+        if (context_limited) max_tokens = generation_room;
+        if (max_tokens <= 0 && cfg->gen.n_predict > 0) {
+            agent_set_error(w, "context has no generation room after compaction; use a larger --ctx");
+            return 1;
+        }
+
+        bool in_think = resume_assistant ? resume_in_think : ds4_think_mode_enabled(think_mode);
+        resume_assistant = false;
+        agent_tool_syntax tool_syntax = agent_tool_syntax_for_engine(w->engine);
+        agent_dsml_parser dsml = {
+            .syntax = tool_syntax,
+            .state = AGENT_DSML_SEARCH,
+        };
+        srv_stream stream;
+        srv_stream_init(&stream, &dsml, tool_syntax, w, srv_turn_emit, w);
+        stream.in_think = in_think;
+        bool got_tool = false;
+        bool malformed_tool = false;
+        bool model_stopped = false;
+        int generated = 0;
+        int compaction_lookahead = 0;
+        double t0 = now_sec();
+        pthread_mutex_lock(&w->mu);
+        w->status.state = AGENT_WORKER_GENERATING;
+        w->status.prefill_tps = 0.0;
+        w->status.greedy_sampling = false;
+        agent_wake_locked(w);
+        pthread_mutex_unlock(&w->mu);
+
+        bool status_greedy_sampling = false;
+        while (generated < max_tokens && !worker_should_interrupt(w)) {
+            worker_apply_pending_power(w);
+            bool greedy_sampling = agent_stream_wants_greedy_sampling(&stream);
+            if (greedy_sampling != status_greedy_sampling) {
+                worker_set_greedy_sampling(w, greedy_sampling);
+                status_greedy_sampling = greedy_sampling;
+            }
+            int token = worker_sample_with_mode(w, cfg, greedy_sampling, &rng);
+            if (ds4_token_is_stop_for_think_mode(w->engine, token, think_mode)) {
+                model_stopped = true;
+                if (tool_syntax == AGENT_TOOL_SYNTAX_GLM &&
+                    token != ds4_token_eos(w->engine)) {
+                    agent_trace(w, "glm assistant generation stopped before control token id=%d", token);
+                }
+                break;
+            }
+
+            int toks[17];
+            int ntok = 0;
+            const int block_start = ds4_session_pos(w->session);
+            if (ds4_engine_mtp_draft_tokens(w->engine) > 1 &&
+                getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+                ntok = ds4_session_eval_speculative(
+                    w->session, token, max_tokens - generated,
+                    ds4_token_eos(w->engine),
+                    greedy_sampling ? 0.0f : cfg->gen.temperature, 0,
+                    greedy_sampling ? 1.0f : cfg->gen.top_p,
+                    greedy_sampling ? 0.0f : cfg->gen.min_p,
+                    &rng, toks, (int)(sizeof(toks) / sizeof(toks[0])),
+                    err, sizeof(err));
+                if (ntok < 0) {
+                    agent_dsml_parser_free(&dsml);
+                    agent_set_error(w, err);
+                    return 1;
+                }
+            } else {
+                if (ds4_session_eval(w->session, token,
+                                     err, sizeof(err)) != 0) {
+                    agent_dsml_parser_free(&dsml);
+                    agent_set_error(w, err);
+                    return 1;
+                }
+                toks[0] = token;
+                ntok = 1;
+            }
+            if (ntok == 0) {
+                agent_dsml_parser_free(&dsml);
+                agent_set_error(w, "decode returned no tokens");
+                return 1;
+            }
+
+            bool stop_block = false;
+            bool restart_sampling = false;
+            for (int ti = 0; ti < ntok && generated < max_tokens; ti++) {
+                token = toks[ti];
+                if (ds4_token_is_stop_for_think_mode(w->engine,
+                                                     token,
+                                                     think_mode)) {
+                    model_stopped = true;
+                    ds4_session_rewind(w->session, block_start + ti);
+                    stop_block = true;
+                    break;
+                }
+
+                if (worker_finish_generated_token(w, token, &generated, t0,
+                                                  &stream, false,
+                                                  err, sizeof(err)) != 0) {
+                    agent_dsml_parser_free(&dsml);
+                    agent_set_error(w, err);
+                    return 1;
+                }
+
+                const bool next_greedy =
+                    agent_stream_wants_greedy_sampling(&stream);
+                if (next_greedy != status_greedy_sampling) {
+                    worker_set_greedy_sampling(w, next_greedy);
+                    status_greedy_sampling = next_greedy;
+                }
+
+                if (dsml.state == AGENT_DSML_DONE) {
+                    got_tool = true;
+                    stop_block = true;
+                } else if (dsml.state == AGENT_DSML_ERROR ||
+                           stream.dsml_in_think) {
+                    malformed_tool = true;
+                    stop_block = true;
+                }
+                if (stop_block) {
+                    if (ti + 1 < ntok) {
+                        ds4_session_rewind(w->session,
+                                           block_start + ti + 1);
+                    }
+                    break;
+                }
+
+                /* Opportunistic drafts already match greedy continuation in
+                 * either mode; only exact sampling needs a new distribution. */
+                if (ti + 1 < ntok && ds4_engine_mtp_exact_sampling(w->engine) &&
+                    cfg->gen.temperature > 0.0f && next_greedy != greedy_sampling) {
+                    /* Later tokens were proposed under the old parser mode.
+                     * Re-evaluate this boundary token to restore its logits,
+                     * then sample the suffix under the new mode. */
+                    if (agent_worker_rewind(w, block_start + ti,
+                                             err, sizeof(err)) != 0 ||
+                        ds4_session_eval(w->session, token,
+                                         err, sizeof(err)) != 0) {
+                        agent_dsml_parser_free(&dsml);
+                        agent_set_error(w, err);
+                        return 1;
+                    }
+                    restart_sampling = true;
+                    break;
+                }
+            }
+            if (stop_block) break;
+            if (restart_sampling) continue;
+            /* Resolve a split tool/thinking delimiter before rebuilding the
+             * parser. Use at most half of the reserved 64-token safety margin,
+             * and never extend the user's output limit. */
+            if (context_limited && generated == max_tokens &&
+                compaction_lookahead < 32 &&
+                agent_stream_compaction_needs_lookahead(&stream)) {
+                max_tokens++;
+                compaction_lookahead++;
+                if (max_tokens == cfg->gen.n_predict - carried_generation)
+                    context_limited = false;
+            }
+        }
+
+        agent_trace(w, "generation finished tool_round=%d generated=%d carried=%d context_limited=%d",
+                    tool_round, generated, carried_generation, context_limited);
+        bool interrupted = worker_should_interrupt(w);
+        const bool partial_tool = stream.dsml_active || stream.dsml_start_len > 0 ||
+                                  dsml.state != AGENT_DSML_SEARCH;
+        srv_stream_text(&stream, NULL, 0, true);
+        srv_stream_free(&stream);
+        worker_set_greedy_sampling(w, false);
+        if (!got_tool && dsml.state == AGENT_DSML_DONE && dsml.calls.len > 0)
+            got_tool = true;
+        if (interrupted) {
+            agent_worker_append_assistant_turn_end(w);
+            agent_dsml_parser_free(&dsml);
+            agent_publish_system_status(w, "Stopped by user");
+            worker_clear_interrupt(w);
+            agent_set_status(w, AGENT_WORKER_IDLE);
+            return 0;
+        }
+        if (context_limited && generated == max_tokens && !model_stopped &&
+            !got_tool && !malformed_tool) {
+            carried_generation += generated;
+            if (partial_tool) {
+                /* No tool from this unfinished round has run. Remove the
+                 * partial arguments before asking the model to retry. */
+                w->transcript.len = assistant_start;
+                ds4_session_invalidate(w->session);
+            }
+            agent_dsml_parser_free(&dsml);
+            agent_trace(w, "generation context boundary: generated=%d partial_tool=%d",
+                        generated, partial_tool);
+            int open_assistant = assistant_start;
+            if (!agent_worker_compact_transcript(w, "generation reached compaction reserve",
+                                       partial_tool ? NULL : &open_assistant,
+                                       compact_err, sizeof(compact_err))) {
+                if (agent_err_is_interrupted(compact_err)) {
+                    worker_clear_interrupt(w);
+                    agent_set_status(w, AGENT_WORKER_IDLE);
+                    return 0;
+                }
+                agent_set_error(w, compact_err);
+                return 1;
+            }
+            if (partial_tool) {
+                ds4_chat_append_message(w->engine, &w->transcript, "user",
+                "The last tool call was interrupted by context compaction and was NOT executed. "
+                "Continue the user's task, respecting its constraints. If a tool is needed, "
+                "retry with smaller arguments or smaller edits.\n");
+            } else {
+                resume_assistant = true;
+                resume_start = open_assistant;
+                resume_in_think = stream.in_think;
+            }
+            continue;
+        }
+        if (stream.dsml_in_think) {
+            got_tool = false;
+            malformed_tool = true;
+            snprintf(dsml.error, sizeof(dsml.error),
+                     "tool calling is not allowed inside <think></think>");
+        } else if (!malformed_tool && dsml.state == AGENT_DSML_ERROR) {
+            malformed_tool = true;
+        } else if (!got_tool && !malformed_tool &&
+                   !interrupted &&
+                   (dsml.state == AGENT_DSML_STRUCTURAL ||
+                    dsml.state == AGENT_DSML_PARAM_VALUE))
+        {
+            malformed_tool = true;
+            snprintf(dsml.error, sizeof(dsml.error),
+                     tool_syntax == AGENT_TOOL_SYNTAX_GLM ?
+                     "incomplete GLM tool call" :
+                     "incomplete DSML tool call");
+        }
+
+        agent_worker_append_assistant_turn_end(w);
+
+        if (!got_tool && !malformed_tool) {
+            agent_dsml_parser_free(&dsml);
+            agent_set_status(w, AGENT_WORKER_IDLE);
+            return 0;
+        }
+
+        agent_tool_observation observation;
+        agent_tool_observation_init(&observation);
+        if (malformed_tool) {
+            agent_tool_observation_puts(
+                &observation, tool_syntax == AGENT_TOOL_SYNTAX_GLM ?
+                "Tool error: invalid GLM tool call: " :
+                "Tool error: invalid DSML tool call: ");
+            agent_tool_observation_puts(
+                &observation, dsml.error[0] ? dsml.error : "parse error");
+            agent_tool_observation_puts(&observation, "\n");
+            agent_tool_observation_puts(
+                &observation, tool_syntax == AGENT_TOOL_SYNTAX_GLM ?
+                agent_glm_syntax_reminder : agent_dsml_syntax_reminder);
+        } else {
+            agent_tool_observation_free(&observation);
+            bool tool_interrupted = false;
+            observation = worker_request_tool_exec(w, &dsml.calls,
+                                                   &tool_interrupted);
+            if (tool_interrupted) {
+                agent_tool_observation_free(&observation);
+                agent_dsml_parser_free(&dsml);
+                agent_worker_append_assistant_turn_end(w);
+                agent_publish_system_status(w, "Stopped by user");
+                worker_clear_interrupt(w);
+                agent_set_status(w, AGENT_WORKER_IDLE);
+                return 0;
+            }
+        }
+        int projected_tokens = 0;
+        int result_reserve = agent_tool_result_reserve_tokens(w);
+        char append_err[160] = {0};
+        int fits = agent_tool_observation_fits(w, &observation, result_reserve,
+                                               &projected_tokens, append_err, sizeof(append_err));
+        if (fits < 0) goto observation_error;
+        if (!fits)
+        {
+            if (!agent_worker_compact(w, "tool result would exceed context",
+                                      compact_err, sizeof(compact_err)))
+            {
+                agent_tool_observation_free(&observation);
+                agent_dsml_parser_free(&dsml);
+                if (agent_err_is_interrupted(compact_err)) {
+                    worker_clear_interrupt(w);
+                    agent_set_status(w, AGENT_WORKER_IDLE);
+                    return 0;
+                }
+                agent_set_error(w, compact_err[0] ? compact_err : "context compaction failed");
+                return 1;
+            }
+            fits = agent_tool_observation_fits(w, &observation, result_reserve,
+                                                &projected_tokens, append_err, sizeof(append_err));
+            if (fits < 0) goto observation_error;
+            if (!fits)
+            {
+                agent_tool_observation_free(&observation);
+                agent_tool_observation_init(&observation);
+                char msg[256];
+                snprintf(msg, sizeof(msg),
+                         "Tool error: tool result still does not fit after context compaction "
+                         "(projected_prompt=%d tokens, ctx=%d, reserve=%d). "
+                         "Retry with a smaller read/search/bash output.\n",
+                         projected_tokens, agent_worker_effective_ctx_size(w),
+                         result_reserve);
+                agent_tool_observation_puts(&observation, msg);
+                fits = agent_tool_observation_fits(w, &observation, 16, NULL,
+                                                   append_err, sizeof(append_err));
+                if (fits < 0) goto observation_error;
+                if (!fits) {
+                    agent_tool_observation_free(&observation);
+                    agent_dsml_parser_free(&dsml);
+                    agent_set_error(w, "context full after compaction");
+                    return 1;
+                }
+            }
+        }
+        if (!agent_tool_observation_commit(w, &observation,
+                                           append_err, sizeof(append_err)))
+            goto observation_error;
+        agent_tool_observation_free(&observation);
+        agent_dsml_parser_free(&dsml);
+        carried_generation = 0;
+
+        char *queued_user = worker_request_queued_user_drain(w);
+        if (queued_user && queued_user[0]) {
+            agent_trace_text(w, "queued_user", queued_user, strlen(queued_user));
+            if (!agent_worker_append_user(w, queued_user, compact_err, sizeof(compact_err))) {
+                free(queued_user);
+                if (agent_err_is_interrupted(compact_err)) {
+                    worker_clear_interrupt(w);
+                    agent_set_status(w, AGENT_WORKER_IDLE);
+                    return 0;
+                }
+                agent_set_error(w, compact_err);
+                return 1;
+            }
+            pthread_mutex_lock(&w->mu);
+            w->user_activity = true;
+            w->session_dirty = true;
+            agent_wake_locked(w);
+            pthread_mutex_unlock(&w->mu);
+        }
+        free(queued_user);
+        continue;
+
+observation_error:
+        agent_tool_observation_free(&observation);
+        agent_dsml_parser_free(&dsml);
+        agent_set_error(w, append_err[0] ? append_err : "unable to append tool observation");
+        return 1;
+    }
 }
 
 /* ========================================================================= */

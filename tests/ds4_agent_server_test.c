@@ -546,6 +546,166 @@ static void test_srv_publish_stream(void) {
     fake_worker_destroy(&w);
 }
 
+/* ---- T6b: turn-suspend handshakes (TOOL_CALLS/TOOL_RESULT, DRAIN) ------ */
+
+#include <pthread.h>
+#include <time.h>
+
+static void short_sleep(void) {
+    struct timespec d = {0, 5 * 1000 * 1000};
+    nanosleep(&d, NULL);
+}
+
+static const srv_msg *fifo_find(const agent_worker *w, uint32_t type) {
+    for (const srv_msg *m = w->fifo_head; m; m = m->next)
+        if (m->type == type) return m;
+    return NULL;
+}
+
+struct te_arg {
+    agent_worker *w;
+    const agent_tool_calls *calls;
+    agent_tool_observation obs;
+    bool intr;
+    bool done;
+};
+
+static void *te_thread(void *p) {
+    struct te_arg *a = p;
+    a->obs = worker_request_tool_exec(a->w, a->calls, &a->intr);
+    a->done = true;
+    return NULL;
+}
+
+static agent_tool_calls one_call(const char *name, const char *arg, const char *val) {
+    agent_tool_calls calls = {0};
+    agent_tool_call c = {0};
+    c.name = xstrdup(name);
+    c.args = xmalloc(sizeof(c.args[0]));
+    c.args[0].name = xstrdup(arg);
+    c.args[0].value = xstrdup(val);
+    c.args[0].is_string = true;
+    c.argc = 1;
+    c.argcap = 1;
+    agent_tool_calls_push(&calls, &c);
+    return calls;
+}
+
+static void test_tool_exec_handshake(void) {
+    agent_worker w;
+    fake_worker(&w);
+    agent_tool_calls calls = one_call("read", "path", "src/x.c");
+
+    struct te_arg a = { .w = &w, .calls = &calls };
+    pthread_t th;
+    pthread_create(&th, NULL, te_thread, &a);
+
+    for (int i = 0; i < 400 && !fifo_find(&w, AGENT_MSG_TOOL_CALLS); i++)
+        short_sleep();
+    const srv_msg *m = fifo_find(&w, AGENT_MSG_TOOL_CALLS);
+    CHECK(m != NULL);
+    if (m) {
+        ap_reader r;
+        ap_reader_init(&r, m->body.data, m->body.len);
+        ap_tool_calls tc;
+        CHECK(ap_decode_tool_calls(&r, &tc));
+        CHECK(tc.request_id == 1);
+        CHECK(tc.call_count == 1);
+        CHECK(tc.calls[0].name_len == 4 &&
+              memcmp(tc.calls[0].name, "read", 4) == 0);
+        CHECK(tc.calls[0].arg_count == 1);
+        CHECK(memcmp(tc.calls[0].args[0].value, "src/x.c", 7) == 0);
+    }
+
+    ap_tool_result tr = {0};
+    tr.request_id = 1;
+    tr.text_parts[0].ptr = "file contents here\n";
+    tr.text_parts[0].len = strlen("file contents here\n");
+    tr.text_part_count = 1;
+    worker_answer_tool_exec(&w, &tr);
+
+    pthread_join(th, NULL);
+    CHECK(a.done && !a.intr);
+    CHECK(a.obs.part_count >= 1 && a.obs.parts[0].text);
+    CHECK(strstr(a.obs.parts[0].text, "file contents here") != NULL);
+
+    agent_tool_observation_free(&a.obs);
+    agent_tool_calls_free(&calls);
+    fake_worker_destroy(&w);
+}
+
+static void test_tool_exec_interrupt(void) {
+    agent_worker w;
+    fake_worker(&w);
+    agent_tool_calls calls = one_call("bash", "command", "sleep 100");
+
+    struct te_arg a = { .w = &w, .calls = &calls };
+    pthread_t th;
+    pthread_create(&th, NULL, te_thread, &a);
+
+    for (int i = 0; i < 400; i++) {
+        pthread_mutex_lock(&w.mu);
+        bool pending = w.tool_exec_pending;
+        pthread_mutex_unlock(&w.mu);
+        if (pending) break;
+        short_sleep();
+    }
+    worker_interrupt(&w);
+    pthread_join(th, NULL);
+
+    CHECK(a.done && a.intr);
+    CHECK(a.obs.part_count == 1 && (!a.obs.parts[0].text || a.obs.parts[0].text[0] == '\0'));
+
+    agent_tool_observation_free(&a.obs);
+    agent_tool_calls_free(&calls);
+    fake_worker_destroy(&w);
+}
+
+struct drain_arg { agent_worker *w; char *result; bool done; };
+static void *drain_thread(void *p) {
+    struct drain_arg *a = p;
+    a->result = worker_request_queued_user_drain(a->w);
+    a->done = true;
+    return NULL;
+}
+
+static void test_drain_handshake(void) {
+    agent_worker w;
+    fake_worker(&w);
+
+    struct drain_arg a = { .w = &w };
+    pthread_t th;
+    pthread_create(&th, NULL, drain_thread, &a);
+
+    for (int i = 0; i < 400 && !fifo_find(&w, AGENT_MSG_DRAIN_REQUEST); i++)
+        short_sleep();
+    CHECK(fifo_find(&w, AGENT_MSG_DRAIN_REQUEST) != NULL);
+
+    worker_answer_queued_user_drain(&w, xstrdup("keep going"));
+    pthread_join(th, NULL);
+
+    CHECK(a.done && a.result && strcmp(a.result, "keep going") == 0);
+    free(a.result);
+    fake_worker_destroy(&w);
+}
+
+static void test_turn_emit_stream(void) {
+    agent_worker w;
+    fake_worker(&w);
+    srv_turn_emit(&w, 0, AGENT_STREAM_NORMAL, "hi", 2);
+    const srv_msg *m = fifo_find(&w, AGENT_MSG_STREAM);
+    CHECK(m != NULL);
+    if (m) {
+        ap_reader r;
+        ap_reader_init(&r, m->body.data, m->body.len);
+        ap_stream s;
+        CHECK(ap_decode_stream(&r, &s));
+        CHECK(s.kind == AGENT_STREAM_NORMAL && s.text_len == 2 &&
+              memcmp(s.text, "hi", 2) == 0);
+    }
+    fake_worker_destroy(&w);
+}
+
 int main(void) {
     test_parse_defaults();
     test_parse_engine_flags();
@@ -567,6 +727,10 @@ int main(void) {
     test_srv_dispatch_turn();
     test_srv_dispatch_stop_interrupt();
     test_srv_publish_stream();
+    test_tool_exec_handshake();
+    test_tool_exec_interrupt();
+    test_drain_handshake();
+    test_turn_emit_stream();
 
     if (failures) {
         fprintf(stderr, "%d agent server test(s) failed\n", failures);
