@@ -768,6 +768,193 @@ static void test_compact_summary_and_banner_streams(void) {
     fake_worker_destroy(&w);
 }
 
+/* ---- T7: CONFIG dispatch, session list, history helpers -------------- */
+
+static ap_map decode_map_reply(const srv_msg *m) {
+    ap_reader r;
+    ap_reader_init(&r, m->body.data, m->body.len);
+    uint32_t tag = 0;
+    CHECK(ap_get_reply_tag(&r, &tag));
+    CHECK(tag == AP_REPLY_MAP);
+    ap_map mp = {0};
+    CHECK(ap_get_map(&r, &mp));
+    return mp;
+}
+
+static void test_config_power_hints(void) {
+    agent_worker w;
+    fake_worker(&w);
+    srv_conn_ctx c = { .w = &w };
+    ap_buf b;
+
+    /* power set 55 */
+    ap_buf_init(&b);
+    ap_encode_config_set_u32(&b, AGENT_CONFIG_POWER, 55);
+    CHECK(srv_dispatch_frame(&c, AGENT_MSG_CONFIG, &b) == SRV_DISPATCH_CONTINUE);
+    ap_buf_free(&b);
+    CHECK(w.power_requested && w.requested_power == 55);
+    {
+        ap_map mp = decode_map_reply(w.fifo_tail);
+        CHECK(ap_map_get_bool(&mp, "ok", false) == true);
+        CHECK(ap_map_get_u32(&mp, "value", 0) == 55);
+    }
+
+    /* power set 0 -> rejected */
+    ap_buf_init(&b);
+    ap_encode_config_set_u32(&b, AGENT_CONFIG_POWER, 0);
+    srv_dispatch_frame(&c, AGENT_MSG_CONFIG, &b);
+    ap_buf_free(&b);
+    {
+        ap_map mp = decode_map_reply(w.fifo_tail);
+        CHECK(ap_map_get_bool(&mp, "ok", true) == false);
+    }
+
+    /* hints set true */
+    ap_buf_init(&b);
+    ap_encode_config_set_bool(&b, AGENT_CONFIG_HINTS, true);
+    srv_dispatch_frame(&c, AGENT_MSG_CONFIG, &b);
+    ap_buf_free(&b);
+    CHECK(w.hints.enabled == true);
+    {
+        ap_map mp = decode_map_reply(w.fifo_tail);
+        CHECK(ap_map_get_bool(&mp, "ok", false) == true);
+        CHECK(ap_map_get_u32(&mp, "value", 9) == 1);
+    }
+
+    /* hints get */
+    ap_buf_init(&b);
+    ap_encode_config_get(&b, AGENT_CONFIG_HINTS);
+    srv_dispatch_frame(&c, AGENT_MSG_CONFIG, &b);
+    ap_buf_free(&b);
+    {
+        ap_map mp = decode_map_reply(w.fifo_tail);
+        CHECK(ap_map_get_u32(&mp, "value", 9) == 1);
+    }
+
+    fake_worker_destroy(&w);
+}
+
+static void write_fake_kv(const char *dir, const char *sha40,
+                          const char *user_prompt, uint32_t tokens,
+                          uint64_t created, uint64_t last_used) {
+    char path[600];
+    snprintf(path, sizeof(path), "%s/%s.kv", dir, sha40);
+    char text[512];
+    int tn = snprintf(text, sizeof(text),
+                      "<\xef\xbd\x9c" "User\xef\xbd\x9c>%s"
+                      "<\xef\xbd\x9c" "Assistant\xef\xbd\x9c>ok",
+                      user_prompt);
+    uint8_t h[DS4_KVSTORE_FIXED_HEADER];
+    ds4_kvstore_fill_header(h, 1, 4, ds4_kvstore_reason_code("agent-session"),
+                            0, tokens, 0, 8192, created, last_used, 64);
+    uint8_t tb[4];
+    ds4_kvstore_le_put32(tb, (uint32_t)tn);
+    FILE *fp = fopen(path, "wb");
+    CHECK(fp != NULL);
+    if (!fp) return;
+    fwrite(h, 1, sizeof(h), fp);
+    fwrite(tb, 1, 4, fp);
+    fwrite(text, 1, (size_t)tn, fp);
+    uint8_t payload[64] = {0};
+    fwrite(payload, 1, sizeof(payload), fp);
+    fclose(fp);
+}
+
+static void test_session_list_encode(void) {
+    char dir[] = "/tmp/ds4agentsrvtestXXXXXX";
+    CHECK(mkdtemp(dir) != NULL);
+    write_fake_kv(dir, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "fix the parser bug", 1200, 1710000000, 1710000500);
+    write_fake_kv(dir, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                  "write the readme", 340, 1710000100, 1710000100);
+
+    agent_worker w;
+    fake_worker(&w);
+    w.engine = NULL;              /* skips the model-id filter */
+    w.cache_dir = dir;
+    memcpy(w.session_sha, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 41);
+
+    ap_buf body;
+    ap_buf_init(&body);
+    server_session_list_encode(&w, &body);
+
+    ap_reader r;
+    ap_reader_init(&r, body.data, body.len);
+    uint32_t tag = 0;
+    CHECK(ap_get_reply_tag(&r, &tag) && tag == AP_REPLY_ARR);
+    uint32_t rows = 0;
+    CHECK(ap_get_arr(&r, &rows));
+    CHECK(rows == 2);
+
+    bool saw_a = false, saw_b = false;
+    for (uint32_t i = 0; i < rows; i++) {
+        ap_map mp = {0};
+        CHECK(ap_get_map(&r, &mp));
+        char sha[64] = {0};
+        ap_map_get_str(&mp, "sha", sha, sizeof(sha));
+        char title[128] = {0};
+        ap_map_get_str(&mp, "title", title, sizeof(title));
+        if (strncmp(sha, "aaaa", 4) == 0) {
+            saw_a = true;
+            CHECK(strcmp(title, "fix the parser bug") == 0);
+            CHECK(ap_map_get_u32(&mp, "tokens", 0) == 1200);
+            CHECK(ap_map_get_bool(&mp, "is_current", true) == false);
+        } else if (strncmp(sha, "bbbb", 4) == 0) {
+            saw_b = true;
+            CHECK(ap_map_get_bool(&mp, "is_current", false) == true);
+        }
+    }
+    CHECK(saw_a && saw_b);
+
+    ap_buf_free(&body);
+    w.cache_dir = NULL; /* not owned */
+    fake_worker_destroy(&w);
+
+    char rm[700];
+    snprintf(rm, sizeof(rm), "%s/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.kv", dir);
+    unlink(rm);
+    snprintf(rm, sizeof(rm), "%s/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.kv", dir);
+    unlink(rm);
+    rmdir(dir);
+}
+
+static void test_history_helpers(void) {
+    const char *text =
+        "sys stuff <\xef\xbd\x9c" "User\xef\xbd\x9c>hello there"
+        "<\xef\xbd\x9c" "Assistant\xef\xbd\x9c>hi";
+    size_t len = strlen(text);
+    agent_history_mark mk = AGENT_HISTORY_MARK_NONE;
+    size_t mlen = 0;
+    const char *m = agent_history_next_marker(text, text + len, &mk, &mlen);
+    CHECK(m != NULL && mk == AGENT_HISTORY_MARK_USER);
+    const char *m2 = agent_history_next_marker(m + mlen, text + len, &mk, &mlen);
+    CHECK(m2 != NULL && mk == AGENT_HISTORY_MARK_ASSISTANT);
+
+    /* tool-result unwrap */
+    const char *tr = "<tool_result>payload body</tool_result>";
+    const char *p = tr, *e = tr + strlen(tr);
+    CHECK(agent_history_tool_result_payload(&p, &e));
+    CHECK((size_t)(e - p) == strlen("payload body") &&
+          memcmp(p, "payload body", 12) == 0);
+    CHECK(agent_history_is_tool_user(tr, tr + strlen(tr)));
+
+    /* latest compaction summary between the fixed markers */
+    const char *comp =
+        "[ds4-agent compacted earlier conversation. Durable task-state summary follows.]\n"
+        "the durable summary\n"
+        "[End compacted summary. Recent conversation continues verbatim below.]\n";
+    const char *ss = NULL, *se = NULL;
+    CHECK(agent_history_latest_compaction_summary(comp, strlen(comp), &ss, &se));
+    CHECK(se > ss && memcmp(ss, "the durable summary", 18) == 0);
+
+    /* tail_start line clamp */
+    const char *lines = "l1\nl2\nl3\nl4\nl5\n";
+    bool trunc = false;
+    const char *st = agent_history_tail_start(lines, lines + strlen(lines),
+                                              2, 0, &trunc);
+    CHECK(trunc && strcmp(st, "l4\nl5\n") == 0);
+}
+
 int main(void) {
     test_parse_defaults();
     test_parse_engine_flags();
@@ -796,6 +983,9 @@ int main(void) {
     test_compact_tail_boundary();
     test_compact_image_boundary();
     test_compact_summary_and_banner_streams();
+    test_config_power_hints();
+    test_session_list_encode();
+    test_history_helpers();
 
     if (failures) {
         fprintf(stderr, "%d agent server test(s) failed\n", failures);

@@ -26,6 +26,7 @@
 
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <limits.h>
 #include <netdb.h>
@@ -615,6 +616,25 @@ static void srv_fifo_push_stream_locked(agent_worker *w, uint32_t kind,
 /* Turn-suspend handshakes: the reader thread wakes the worker (T6b section). */
 static void worker_answer_tool_exec(agent_worker *w, const ap_tool_result *tr);
 static void worker_answer_queued_user_drain(agent_worker *w, char *text);
+
+/* Session persistence + CONFIG dispatch targets (T7 section). */
+static bool agent_worker_save_session_now(agent_worker *w, char sha_out[41],
+                                          int *tokens_out, char *err, size_t err_len);
+static bool agent_worker_switch_session(agent_worker *w, const char *prefix,
+                                        char sha_out[41], char **title_out,
+                                        int *ctx_used_out,
+                                        char *err, size_t err_len);
+static bool agent_worker_show_history(agent_worker *w, int user_turns,
+                                      char *err, size_t err_len);
+static bool agent_worker_delete_session(agent_worker *w, const char *prefix,
+                                        char sha_out[41], char *err, size_t err_len);
+static bool agent_worker_strip_session(agent_worker *w, const char *prefix,
+                                       char sha_out[41], uint32_t *tokens_out,
+                                       char *err, size_t err_len);
+static bool agent_worker_needs_save(agent_worker *w);
+static void server_session_list_encode(agent_worker *w, ap_buf *body);
+static void worker_request_save(agent_worker *w);
+static void worker_request_compact(agent_worker *w);
 
 /* Context compaction (T6c section). */
 static bool agent_worker_compact(agent_worker *w, const char *reason,
@@ -3847,9 +3867,101 @@ static srv_dispatch_result srv_dispatch_session(srv_conn_ctx *c, ap_reader *r) {
         srv_fifo_push(w, AGENT_MSG_SESSION, &body);
         break;
     }
+    case AGENT_SESSION_SAVE: {
+        ap_map_writer mw;
+        ap_put_reply_map_begin(&body, &mw);
+        if (!worker_is_idle(w)) {
+            worker_request_save(w);
+            ap_map_put_bool(&mw, "ok", true);
+            ap_map_put_bool(&mw, "scheduled", true);
+            ap_map_put_cstr(&mw, "sha", "");
+            ap_map_put_u32(&mw, "tokens", 0);
+            ap_map_put_cstr(&mw, "error", "");
+        } else {
+            char serr[256] = {0};
+            char sha[41] = {0};
+            int tokens = 0;
+            bool ok = agent_worker_save_session_now(w, sha, &tokens,
+                                                    serr, sizeof(serr));
+            ap_map_put_bool(&mw, "ok", ok);
+            ap_map_put_bool(&mw, "scheduled", false);
+            ap_map_put_cstr(&mw, "sha", ok ? sha : "");
+            ap_map_put_u32(&mw, "tokens", ok ? (uint32_t)tokens : 0);
+            ap_map_put_cstr(&mw, "error", ok ? "" : serr);
+        }
+        ap_map_end(&mw);
+        srv_fifo_push(w, AGENT_MSG_SESSION, &body);
+        break;
+    }
+    case AGENT_SESSION_SWITCH: {
+        const char *prefix = m.switch_args.sha_prefix;
+        size_t plen = strlen(prefix);
+        char sha[41] = {0};
+        char *title = NULL;
+        int ctx_used = 0;
+        char serr[256] = {0};
+        bool ok;
+        /* the current session's own sha => re-dump its history, no reload */
+        if (plen && w->session_sha[0] &&
+            strncasecmp(w->session_sha, prefix, plen) == 0) {
+            memcpy(sha, w->session_sha, 41);
+            title = xstrdup(w->session_title ? w->session_title : "");
+            ctx_used = w->transcript.len;
+            ok = true;
+        } else {
+            ok = agent_worker_switch_session(w, prefix, sha, &title,
+                                             &ctx_used, serr, sizeof(serr));
+        }
+        ap_map_writer mw;
+        ap_put_reply_map_begin(&body, &mw);
+        ap_map_put_bool(&mw, "ok", ok);
+        ap_map_put_cstr(&mw, "sha", ok ? sha : "");
+        ap_map_put_cstr(&mw, "title", title ? title : "");
+        ap_map_put_u32(&mw, "ctx_used", ok ? (uint32_t)ctx_used : 0);
+        ap_map_put_cstr(&mw, "error", ok ? "" : serr);
+        ap_map_end(&mw);
+        srv_fifo_push(w, AGENT_MSG_SESSION, &body);
+        free(title);
+        if (ok && m.switch_args.history_turns > 0) {
+            char herr[160] = {0};
+            agent_worker_show_history(w, (int)m.switch_args.history_turns,
+                                      herr, sizeof(herr));
+        }
+        break;
+    }
+    case AGENT_SESSION_LIST:
+        server_session_list_encode(w, &body);
+        srv_fifo_push(w, AGENT_MSG_SESSION, &body);
+        break;
+    case AGENT_SESSION_DEL: {
+        char sha[41] = {0};
+        uint32_t tokens = 0;
+        char serr[256] = {0};
+        bool ok = m.del_args.strip
+            ? agent_worker_strip_session(w, m.del_args.sha_prefix, sha,
+                                         &tokens, serr, sizeof(serr))
+            : agent_worker_delete_session(w, m.del_args.sha_prefix, sha,
+                                          serr, sizeof(serr));
+        ap_map_writer mw;
+        ap_put_reply_map_begin(&body, &mw);
+        ap_map_put_bool(&mw, "ok", ok);
+        ap_map_put_cstr(&mw, "sha", ok ? sha : "");
+        ap_map_put_u32(&mw, "tokens", tokens);
+        ap_map_put_cstr(&mw, "error", ok ? "" : serr);
+        ap_map_end(&mw);
+        srv_fifo_push(w, AGENT_MSG_SESSION, &body);
+        break;
+    }
+    case AGENT_SESSION_COMPACT:
+        /* no discrete reply: drives STATUS{COMPACTING} + STREAM{SUMMARY} + a
+         * terminal STATUS from the worker's deferred-compact path. */
+        if (!worker_is_idle(w))
+            agent_publish_system_status(
+                w, "compaction scheduled; it runs at the next turn boundary");
+        worker_request_compact(w);
+        break;
     default:
-        /* save / switch / list / del / compact land in T7. */
-        srv_fifo_push_reply_err(w, AGENT_MSG_SESSION, "not implemented yet");
+        srv_fifo_push_reply_err(w, AGENT_MSG_SESSION, "unknown SESSION sub-command");
         break;
     }
     ap_buf_free(&body);
@@ -3893,9 +4005,71 @@ static srv_dispatch_result srv_dispatch_frame(srv_conn_ctx *c, uint32_t type,
         worker_interrupt(w);
         return SRV_DISPATCH_CONTINUE;
 
-    case AGENT_MSG_CONFIG:
-        srv_fifo_push_reply_err(w, AGENT_MSG_CONFIG, "CONFIG lands in T7");
+    case AGENT_MSG_CONFIG: {
+        ap_config_msg cm;
+        if (!ap_decode_config(&r, &cm)) return SRV_DISPATCH_CLOSE;
+        ap_buf cbody;
+        ap_buf_init(&cbody);
+        ap_map_writer mw;
+        ap_put_reply_map_begin(&cbody, &mw);
+        if (!cm.known) {
+            ap_map_put_bool(&mw, "ok", false);
+            ap_map_put_u32(&mw, "value", 0);
+            ap_map_put_cstr(&mw, "error", "unknown CONFIG key/op");
+        } else if (cm.key == AGENT_CONFIG_POWER) {
+            if (cm.op == AGENT_CONFIG_SET) {
+                bool ok = cm.u32val >= 1 && cm.u32val <= 100;
+                if (ok) worker_request_power(w, (int)cm.u32val);
+                ap_map_put_bool(&mw, "ok", ok);
+                ap_map_put_u32(&mw, "value", ok ? cm.u32val : 0);
+                ap_map_put_cstr(&mw, "error", ok ? "" : "power must be 1..100");
+            } else {
+                pthread_mutex_lock(&w->mu);
+                uint32_t v = (uint32_t)worker_status_power_locked(w);
+                pthread_mutex_unlock(&w->mu);
+                ap_map_put_bool(&mw, "ok", true);
+                ap_map_put_u32(&mw, "value", v);
+                ap_map_put_cstr(&mw, "error", "");
+            }
+        } else if (cm.key == AGENT_CONFIG_STEER) {
+            if (cm.op == AGENT_CONFIG_SET) {
+                if (!worker_is_idle(w)) {
+                    ap_map_put_bool(&mw, "ok", false);
+                    ap_map_put_u32(&mw, "value", 0);
+                    ap_map_put_cstr(&mw, "error",
+                                    "steering can only change while idle");
+                } else {
+                    float scale = (float)ap_milli_to_double(cm.u32val);
+                    bool ok = ds4_session_set_directional_steering_ffn(
+                                  w->session, scale) == 0;
+                    if (ok) w->cfg->engine.directional_steering_ffn = scale;
+                    ap_map_put_bool(&mw, "ok", ok);
+                    ap_map_put_u32(&mw, "value", ok ? cm.u32val : 0);
+                    ap_map_put_cstr(&mw, "error",
+                                    ok ? "" : "engine rejected steering change");
+                }
+            } else {
+                uint32_t v = ap_milli_from_double(
+                    ds4_session_directional_steering_ffn(w->session));
+                ap_map_put_bool(&mw, "ok", true);
+                ap_map_put_u32(&mw, "value", v);
+                ap_map_put_cstr(&mw, "error", "");
+            }
+        } else { /* AGENT_CONFIG_HINTS */
+            bool v;
+            pthread_mutex_lock(&w->mu);
+            if (cm.op == AGENT_CONFIG_SET) w->hints.enabled = cm.boolval;
+            v = w->hints.enabled;
+            pthread_mutex_unlock(&w->mu);
+            ap_map_put_bool(&mw, "ok", true);
+            ap_map_put_u32(&mw, "value", v ? 1 : 0);
+            ap_map_put_cstr(&mw, "error", "");
+        }
+        ap_map_end(&mw);
+        srv_fifo_push(w, AGENT_MSG_CONFIG, &cbody);
+        ap_buf_free(&cbody);
         return SRV_DISPATCH_CONTINUE;
+    }
 
     case AGENT_MSG_SESSION:
         return srv_dispatch_session(c, &r);
@@ -5576,6 +5750,867 @@ observation_error:
         agent_set_error(w, append_err[0] ? append_err : "unable to append tool observation");
         return 1;
     }
+}
+
+/* ========================================================================= */
+/* T7: session persistence sub-commands (SESSION save/switch/list/del/compact)*/
+/*     and CONFIG get/set for power/steer/hints.                              */
+/*                                                                           */
+/* Copied from ds4_agent.c. agent_worker_list_sessions is reworked into an    */
+/* ARR reply (server_session_list_encode); the /switch history dump reuses    */
+/* the pure history helpers but replays the assistant body through srv_stream */
+/* instead of the client-only agent_token_renderer.                           */
+/* ========================================================================= */
+
+static bool agent_worker_needs_save(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    bool yes = w->user_activity && w->session_dirty;
+    pthread_mutex_unlock(&w->mu);
+    return yes;
+}
+
+/* Save the current session under its stable agent identity.  The worker owns
+ * the live KV, so busy /save requests are deferred until a stable append-only
+ * point and then executed by the worker thread. */
+static bool agent_worker_save_session_now(agent_worker *w, char sha_out[41],
+                                          int *tokens_out,
+                                          char *err, size_t err_len) {
+    if (!agent_worker_has_user_session(w)) {
+        snprintf(err, err_len, "nothing to save");
+        return false;
+    }
+    if (w->image_count) {
+        snprintf(err, err_len,
+                 "sessions containing images cannot be saved yet");
+        return false;
+    }
+
+    if (agent_worker_sync_tokens(w, &w->transcript, false, err, err_len) != 0)
+        return false;
+    if (!agent_mkdir_p(w->cache_dir)) {
+        snprintf(err, err_len, "failed to create %s", w->cache_dir);
+        return false;
+    }
+
+    size_t text_len = 0;
+    char *text = ds4_kvstore_render_tokens_text(w->engine, &w->transcript,
+                                                &text_len);
+    if (!text) {
+        snprintf(err, err_len, "failed to render session text");
+        return false;
+    }
+    if (!w->session_title) {
+        w->session_title = agent_session_title_from_text(text, text_len, 0);
+    }
+    if (w->session_created_at == 0)
+        w->session_created_at = (uint64_t)time(NULL);
+
+    char sha[41];
+    agent_session_identity_sha(w->session_title, w->session_created_at, sha);
+    char *path = agent_kv_path_for_sha(w->cache_dir, sha);
+
+    bool ok = agent_kv_save_path(w, path, &w->transcript,
+                                 "agent-session", sha_out,
+                                 w->session_title, w->session_created_at,
+                                 err, err_len);
+    if (ok) {
+        memcpy(w->session_sha, sha, sizeof(w->session_sha));
+        if (w->legacy_session_path_to_delete &&
+            strcmp(w->legacy_session_path_to_delete, path) != 0)
+        {
+            unlink(w->legacy_session_path_to_delete);
+        }
+        free(w->legacy_session_path_to_delete);
+        w->legacy_session_path_to_delete = NULL;
+        pthread_mutex_lock(&w->mu);
+        w->session_dirty = false;
+        agent_wake_locked(w);
+        pthread_mutex_unlock(&w->mu);
+        if (tokens_out) *tokens_out = w->transcript.len;
+    }
+    free(path);
+    free(text);
+    return ok;
+}
+
+static char *agent_session_title_clip(const char *title, size_t max_bytes) {
+    if (!title) return xstrdup("(no user prompt)");
+    size_t len = strlen(title);
+    if (max_bytes == 0 || len <= max_bytes) return xstrdup(title);
+    if (max_bytes < 4) max_bytes = 4;
+    agent_buf b = {0};
+    agent_buf_append(&b, title, max_bytes - 3);
+    agent_buf_puts(&b, "...");
+    return agent_buf_take(&b);
+}
+
+static char *agent_session_title_from_file(const char *path, size_t max_bytes) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return xstrdup("(unreadable session)");
+    ds4_kvstore_entry hdr = {0};
+    uint32_t text_bytes = 0;
+    char *text = NULL;
+    char *trailer_title = NULL;
+    bool ok = ds4_kvstore_read_header(fp, &hdr, &text_bytes) &&
+              agent_kv_read_text(fp, text_bytes, &text, NULL, 0);
+    if (ok && (hdr.ext_flags & DS4_KVSTORE_EXT_SESSION_TITLE))
+        ok = agent_kv_read_title_trailer(fp, &hdr, &trailer_title, NULL, 0);
+    fclose(fp);
+    char *title = ok ?
+        (trailer_title ?
+            agent_session_title_clip(trailer_title, max_bytes) :
+            agent_session_title_from_text(text, text_bytes, max_bytes)) :
+        xstrdup("(unreadable session)");
+    free(trailer_title);
+    free(text);
+    return title;
+}
+
+#define AGENT_HISTORY_DEFAULT_TURNS 3
+#define AGENT_HISTORY_MAX_TURNS 200
+#define AGENT_HISTORY_ASSISTANT_MAX_LINES 80
+#define AGENT_HISTORY_ASSISTANT_MAX_BYTES 12000
+
+typedef enum {
+    AGENT_HISTORY_MARK_NONE,
+    AGENT_HISTORY_MARK_USER,
+    AGENT_HISTORY_MARK_ASSISTANT,
+    AGENT_HISTORY_MARK_EOS,
+} agent_history_mark;
+
+typedef struct {
+    const char **v;
+    agent_history_mark *mark;
+    int len;
+    int cap;
+} agent_history_ptrs;
+
+static void agent_history_ptrs_push(agent_history_ptrs *p, const char *s,
+                                    agent_history_mark mark) {
+    if (p->len == p->cap) {
+        p->cap = p->cap ? p->cap * 2 : 16;
+        p->v = xrealloc(p->v, (size_t)p->cap * sizeof(p->v[0]));
+        p->mark = xrealloc(p->mark, (size_t)p->cap * sizeof(p->mark[0]));
+    }
+    p->v[p->len] = s;
+    p->mark[p->len] = mark;
+    p->len++;
+}
+
+static const char *agent_memmem(const char *hay, size_t hay_len,
+                                const char *needle, size_t needle_len) {
+    if (!needle_len) return hay;
+    if (needle_len > hay_len) return NULL;
+    const char first = needle[0];
+    const char *end = hay + hay_len - needle_len + 1;
+    for (const char *p = hay; p < end; p++) {
+        if (*p == first && memcmp(p, needle, needle_len) == 0) return p;
+    }
+    return NULL;
+}
+
+static const char *agent_history_next_marker(const char *p, const char *end,
+                                             agent_history_mark *mark,
+                                             size_t *mark_len) {
+    static const char user_mark[] = "<｜User｜>";
+    static const char assistant_mark[] = "<｜Assistant｜>";
+    static const char eos_mark[] = "<｜end▁of▁sentence｜>";
+    const char *u = agent_memmem(p, (size_t)(end - p),
+                                 user_mark, sizeof(user_mark) - 1);
+    const char *a = agent_memmem(p, (size_t)(end - p),
+                                 assistant_mark, sizeof(assistant_mark) - 1);
+    const char *e = agent_memmem(p, (size_t)(end - p),
+                                 eos_mark, sizeof(eos_mark) - 1);
+    if (!u && !a && !e) return NULL;
+    if (u && (!a || u < a) && (!e || u < e)) {
+        if (mark) *mark = AGENT_HISTORY_MARK_USER;
+        if (mark_len) *mark_len = sizeof(user_mark) - 1;
+        return u;
+    }
+    if (a && (!e || a < e)) {
+        if (mark) *mark = AGENT_HISTORY_MARK_ASSISTANT;
+        if (mark_len) *mark_len = sizeof(assistant_mark) - 1;
+        return a;
+    }
+    if (mark) *mark = AGENT_HISTORY_MARK_EOS;
+    if (mark_len) *mark_len = sizeof(eos_mark) - 1;
+    return e;
+}
+
+static void agent_history_trim(const char **p, const char **end) {
+    while (*p < *end && isspace((unsigned char)**p)) (*p)++;
+    while (*end > *p && isspace((unsigned char)(*end)[-1])) (*end)--;
+}
+
+static bool agent_history_has_prefix(const char *p, const char *end,
+                                     const char *prefix) {
+    size_t n = strlen(prefix);
+    return (size_t)(end - p) >= n && memcmp(p, prefix, n) == 0;
+}
+
+/* Tool messages are rendered as user turns in the transcript.  Return the
+ * inner payload for the current <tool_result> wrapper so /history skips these
+ * pseudo-user turns and displays their content without leaking the wrapper. */
+static bool agent_history_tool_result_payload(const char **p, const char **end) {
+    const char *s = *p, *e = *end;
+    agent_history_trim(&s, &e);
+
+    const char *open = "<tool_result>";
+    const char *close = "</tool_result>";
+    const size_t open_len = strlen(open);
+    const size_t close_len = strlen(close);
+    if (!agent_history_has_prefix(s, e, open)) return false;
+
+    s += open_len;
+    if ((size_t)(e - s) >= close_len &&
+        memcmp(e - close_len, close, close_len) == 0)
+    {
+        e -= close_len;
+    }
+    *p = s;
+    *end = e;
+    return true;
+}
+
+static bool agent_history_is_tool_user(const char *p, const char *end) {
+    agent_history_trim(&p, &end);
+    return agent_history_tool_result_payload(&p, &end) ||
+           agent_history_has_prefix(p, end, "Tool:") ||
+           agent_history_has_prefix(p, end, "Tool result");
+}
+
+static void agent_history_ptrs_free(agent_history_ptrs *p) {
+    free(p->v);
+    free(p->mark);
+    memset(p, 0, sizeof(*p));
+}
+
+/* Find the oldest rendered-chat marker needed to show the last N user turns.
+ * Tool-result pseudo-user turns are skipped while human turns exist, so
+ * /history stays centered on the human conversation.  Compacted sessions can
+ * legitimately have a tail made only of tool result turns; in that case we
+ * fall back to recent tool/assistant events instead of showing an empty
+ * history. */
+static const char *agent_history_start_for_turns(const char *text, size_t len,
+                                                 int user_turns,
+                                                 bool *tool_only) {
+    const char *end = text + len;
+    agent_history_ptrs marks = {0};
+    agent_history_ptrs users = {0};
+    agent_history_ptrs all_users = {0};
+    const char *p = text;
+    while (p < end) {
+        agent_history_mark mark = AGENT_HISTORY_MARK_NONE;
+        size_t mark_len = 0;
+        const char *m = agent_history_next_marker(p, end, &mark, &mark_len);
+        if (!m) break;
+        agent_history_ptrs_push(&marks, m, mark);
+        const char *content = m + mark_len;
+        agent_history_mark next_mark = AGENT_HISTORY_MARK_NONE;
+        size_t next_len = 0;
+        const char *next = agent_history_next_marker(content, end,
+                                                     &next_mark, &next_len);
+        const char *content_end = next ? next : end;
+        if (mark == AGENT_HISTORY_MARK_USER) {
+            agent_history_ptrs_push(&all_users, m, mark);
+            if (!agent_history_is_tool_user(content, content_end))
+                agent_history_ptrs_push(&users, m, mark);
+        }
+        p = content_end;
+    }
+
+    const char *start = end;
+    if (tool_only) *tool_only = false;
+    if (users.len > 0) {
+        int idx = users.len - user_turns;
+        if (idx < 0) idx = 0;
+        start = users.v[idx];
+    } else if (all_users.len > 0) {
+        int idx = all_users.len - user_turns;
+        if (idx < 0) idx = 0;
+        start = all_users.v[idx];
+        if (tool_only) *tool_only = true;
+
+        /* Tool result messages are stored as user-role turns after the
+         * assistant DSML stanza that produced them.  Include that preceding
+         * assistant marker when it is still in the retained tail, otherwise
+         * replay shows the result but hides the call that caused it. */
+        for (int i = marks.len - 1; i >= 0; i--) {
+            if (marks.v[i] >= start) continue;
+            if (marks.mark[i] == AGENT_HISTORY_MARK_USER) break;
+            if (marks.mark[i] == AGENT_HISTORY_MARK_ASSISTANT) {
+                start = marks.v[i];
+                break;
+            }
+        }
+    }
+    agent_history_ptrs_free(&marks);
+    agent_history_ptrs_free(&users);
+    agent_history_ptrs_free(&all_users);
+    return start;
+}
+
+static bool agent_history_latest_compaction_summary(const char *text,
+                                                    size_t len,
+                                                    const char **sum_start,
+                                                    const char **sum_end) {
+    static const char start_mark[] =
+        "[ds4-agent compacted earlier conversation. Durable task-state summary follows.]";
+    static const char end_mark[] =
+        "[End compacted summary. Recent conversation continues verbatim below.]";
+    const char *end = text + len;
+    const char *scan = text;
+    const char *best_start = NULL;
+    const char *best_end = NULL;
+    while (scan < end) {
+        const char *s = agent_memmem(scan, (size_t)(end - scan),
+                                     start_mark, sizeof(start_mark) - 1);
+        if (!s) break;
+        const char *content = s + sizeof(start_mark) - 1;
+        const char *e = agent_memmem(content, (size_t)(end - content),
+                                     end_mark, sizeof(end_mark) - 1);
+        if (!e) break;
+        best_start = content;
+        best_end = e;
+        scan = e + sizeof(end_mark) - 1;
+    }
+    if (!best_start || !best_end) return false;
+    agent_history_trim(&best_start, &best_end);
+    if (best_start >= best_end) return false;
+    if (sum_start) *sum_start = best_start;
+    if (sum_end) *sum_end = best_end;
+    return true;
+}
+
+static void agent_history_publish_limited(agent_worker *w, const char *p,
+                                          const char *end, int max_lines,
+                                          size_t max_bytes);
+
+static const char *agent_history_skip_utf8_continuation(const char *p,
+                                                        const char *end) {
+    while (p < end && (((unsigned char)*p) & 0xc0) == 0x80) p++;
+    return p;
+}
+
+static const char *agent_history_tail_start(const char *p, const char *end,
+                                            int max_lines, size_t max_bytes,
+                                            bool *truncated) {
+    *truncated = false;
+    if (p >= end) return p;
+
+    const char *start = p;
+    size_t len = (size_t)(end - p);
+    if (max_bytes && len > max_bytes) {
+        start = end - max_bytes;
+        *truncated = true;
+    }
+
+    if (max_lines > 0) {
+        const char *scan = end;
+        if (scan > p && scan[-1] == '\n') scan--;
+        const char *line_start = p;
+        int lines = 0;
+        while (scan > p) {
+            scan--;
+            if (*scan == '\n' && ++lines == max_lines) {
+                line_start = scan + 1;
+                break;
+            }
+        }
+        if (line_start > p) *truncated = true;
+        if (line_start > start) start = line_start;
+    }
+
+    return agent_history_skip_utf8_continuation(start, end);
+}
+
+static void agent_history_publish_limited(agent_worker *w, const char *p,
+                                          const char *end, int max_lines,
+                                          size_t max_bytes) {
+    bool truncated = false;
+    const char *start = agent_history_tail_start(p, end, max_lines, max_bytes,
+                                                 &truncated);
+    if (truncated)
+        agent_publish(w, "\n... earlier history truncated; showing tail ...\n",
+                      strlen("\n... earlier history truncated; showing tail ...\n"));
+    agent_publish(w, start, (size_t)(end - start));
+    if (end > start && end[-1] != '\n') agent_publish(w, "\n", 1);
+}
+
+typedef struct {
+    ds4_kvstore_entry entry;
+    char *title;
+} agent_session_list_item;
+
+static int agent_session_list_cmp_recent(const void *a, const void *b) {
+    const agent_session_list_item *sa = a, *sb = b;
+    uint64_t ta = sa->entry.last_used ? sa->entry.last_used : sa->entry.created_at;
+    uint64_t tb = sb->entry.last_used ? sb->entry.last_used : sb->entry.created_at;
+    if (ta < tb) return 1;
+    if (ta > tb) return -1;
+    return strcmp(sa->entry.sha, sb->entry.sha);
+}
+
+static void agent_session_list_free(agent_session_list_item *v, int n) {
+    for (int i = 0; i < n; i++) {
+        ds4_kvstore_entry_free(&v[i].entry);
+        free(v[i].title);
+    }
+    free(v);
+}
+
+static void agent_session_list_push(agent_session_list_item **v, int *len,
+                                    int *cap, ds4_kvstore_entry entry,
+                                    char *title) {
+    if (*len == *cap) {
+        *cap = *cap ? *cap * 2 : 16;
+        *v = xrealloc(*v, (size_t)*cap * sizeof((*v)[0]));
+    }
+    (*v)[(*len)++] = (agent_session_list_item){
+        .entry = entry,
+        .title = title,
+    };
+}
+
+static bool agent_worker_find_session(agent_worker *w, const char *prefix,
+                                      char sha_out[41], char **path_out,
+                                      char *err, size_t err_len) {
+    size_t plen = strlen(prefix);
+    if (plen == 0 || plen > 40) {
+        snprintf(err, err_len, "invalid session SHA prefix");
+        return false;
+    }
+    for (size_t i = 0; i < plen; i++) {
+        if (!isxdigit((unsigned char)prefix[i])) {
+            snprintf(err, err_len, "invalid session SHA prefix");
+            return false;
+        }
+    }
+
+    DIR *d = opendir(w->cache_dir);
+    if (!d) {
+        snprintf(err, err_len, "%s", strerror(errno));
+        return false;
+    }
+    int matches = 0;
+    char match_sha[41] = {0};
+    char *match_path = NULL;
+    const uint8_t model_id = (uint8_t)ds4_engine_model_id(w->engine);
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        char sha[41];
+        if (!ds4_kvstore_sha_hex_name(de->d_name, sha)) continue;
+        if (strncasecmp(sha, prefix, plen) != 0) continue;
+        char *path = ds4_kvstore_path_join(w->cache_dir, de->d_name);
+        ds4_kvstore_entry e = {0};
+        bool same_model = ds4_kvstore_read_entry_file(path, sha, &e) &&
+                          e.model_id == model_id;
+        ds4_kvstore_entry_free(&e);
+        if (!same_model) {
+            free(path);
+            continue;
+        }
+        matches++;
+        if (matches == 1) {
+            memcpy(match_sha, sha, sizeof(match_sha));
+            match_path = path;
+        } else {
+            free(path);
+        }
+    }
+    closedir(d);
+    if (matches == 0) {
+        snprintf(err, err_len, "no saved session matches %.40s", prefix);
+        return false;
+    }
+    if (matches > 1) {
+        snprintf(err, err_len, "session prefix %.40s is ambiguous", prefix);
+        free(match_path);
+        return false;
+    }
+    memcpy(sha_out, match_sha, 41);
+    *path_out = match_path;
+    return true;
+}
+
+static bool agent_worker_delete_session(agent_worker *w, const char *prefix,
+                                        char sha_out[41],
+                                        char *err, size_t err_len) {
+    char sha[41];
+    char *path = NULL;
+    if (!agent_worker_find_session(w, prefix, sha, &path, err, err_len))
+        return false;
+    if (unlink(path) != 0) {
+        snprintf(err, err_len, "%s", strerror(errno));
+        free(path);
+        return false;
+    }
+    if (sha_out) memcpy(sha_out, sha, 41);
+    free(path);
+    return true;
+}
+
+/* Strip the heavy backend payload from a saved session while preserving its
+ * rendered transcript. Loading such a file later tokenizes the text and
+ * rebuilds the live KV with a full prefill. */
+static bool agent_worker_strip_session(agent_worker *w, const char *prefix,
+                                       char sha_out[41],
+                                       uint32_t *tokens_out,
+                                       char *err, size_t err_len) {
+    if (err && err_len) err[0] = '\0';
+    char sha[41];
+    char *path = NULL;
+    if (!agent_worker_find_session(w, prefix, sha, &path, err, err_len))
+        return false;
+
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        snprintf(err, err_len, "%s", strerror(errno));
+        free(path);
+        return false;
+    }
+
+    ds4_kvstore_entry hdr = {0};
+    uint32_t text_bytes = 0;
+    char *text = NULL;
+    char *title = NULL;
+    bool ok = ds4_kvstore_read_header(fp, &hdr, &text_bytes) &&
+              agent_kv_read_text(fp, text_bytes, &text, err, err_len);
+    if (ok && (hdr.ext_flags & DS4_KVSTORE_EXT_SESSION_TITLE))
+        ok = agent_kv_read_title_trailer(fp, &hdr, &title, err, err_len);
+    fclose(fp);
+    if (!ok) {
+        if (!err[0]) snprintf(err, err_len, "failed to read session");
+        free(title);
+        free(text);
+        free(path);
+        return false;
+    }
+
+    char actual_sha[41];
+    agent_kv_identity_sha(&hdr, text, text_bytes, title, actual_sha);
+    if (strcmp(actual_sha, sha)) {
+        snprintf(err, err_len, "cached session identity does not match file name");
+        free(title);
+        free(text);
+        free(path);
+        return false;
+    }
+
+    ds4_tokens stripped_tokens = {0};
+    ds4_tokenize_rendered_chat(w->engine, text, &stripped_tokens);
+    uint32_t stripped_token_count = (uint32_t)stripped_tokens.len;
+    ds4_tokens_free(&stripped_tokens);
+
+    agent_buf tmpl = {0};
+    agent_buf_puts(&tmpl, path);
+    agent_buf_puts(&tmpl, ".tmp.XXXXXX");
+    char *tmp = agent_buf_take(&tmpl);
+    int fd = mkstemp(tmp);
+    if (fd < 0) {
+        snprintf(err, err_len, "%s", strerror(errno));
+        free(tmp);
+        free(text);
+        free(path);
+        return false;
+    }
+
+    fp = fdopen(fd, "wb");
+    if (!fp) {
+        snprintf(err, err_len, "%s", strerror(errno));
+        close(fd);
+        unlink(tmp);
+        free(tmp);
+        free(text);
+        free(path);
+        return false;
+    }
+
+    uint8_t h[DS4_KVSTORE_FIXED_HEADER];
+    uint64_t now = (uint64_t)time(NULL);
+    ds4_kvstore_fill_header(h, hdr.model_id, hdr.quant_bits, hdr.reason, hdr.ext_flags,
+                            stripped_token_count, hdr.hits, hdr.ctx_size,
+                            hdr.created_at, now, 0);
+    uint8_t tb[4];
+    ds4_kvstore_le_put32(tb, text_bytes);
+
+    errno = 0;
+    ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
+         fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
+         fwrite(text, 1, text_bytes, fp) == text_bytes &&
+         (!(hdr.ext_flags & DS4_KVSTORE_EXT_SESSION_TITLE) ||
+          agent_kv_write_title_trailer(fp, title, err, err_len)) &&
+         fflush(fp) == 0;
+    int saved_errno = errno;
+    if (fclose(fp) != 0) {
+        if (!saved_errno) saved_errno = errno;
+        ok = false;
+    }
+    if (ok && rename(tmp, path) != 0) {
+        saved_errno = errno;
+        ok = false;
+    }
+    if (!ok) {
+        snprintf(err, err_len, "%s",
+                 saved_errno ? strerror(saved_errno) : "failed to write stripped session");
+        unlink(tmp);
+    } else {
+        if (sha_out) memcpy(sha_out, sha, 41);
+        if (tokens_out) *tokens_out = stripped_token_count;
+    }
+
+    free(tmp);
+    free(title);
+    free(text);
+    free(path);
+    return ok;
+}
+
+static void worker_request_save(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    w->save_requested = true;
+    pthread_cond_signal(&w->cond);
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+}
+
+static void worker_request_compact(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    w->compact_requested = true;
+    pthread_cond_signal(&w->cond);
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+}
+
+/* -- history dump (plain text; the client paints) ------------------ */
+
+static void agent_history_render_compaction_summary(agent_worker *w,
+                                                    const char *text,
+                                                    size_t len) {
+    const char *p = NULL, *end = NULL;
+    if (!agent_history_latest_compaction_summary(text, len, &p, &end)) return;
+    agent_publish(w, "\nCompacted Summary:\n", strlen("\nCompacted Summary:\n"));
+    agent_history_publish_limited(w, p, end, 80, 12000);
+}
+
+/* Replay one assistant turn: strip DSML / <think> via the streaming classifier,
+ * emit the visible text as plain STREAM{NORMAL}. No live tool execution. */
+static void srv_history_emit(void *ud, uint32_t stream_id, uint32_t kind,
+                             const char *text, size_t len) {
+    (void)stream_id;
+    if (kind == AGENT_STREAM_THINK) return;
+    agent_publish(ud, text, len);
+}
+
+static void agent_history_render_assistant(agent_worker *w,
+                                           const char *p, const char *end) {
+    agent_history_trim(&p, &end);
+    if (p >= end) return;
+    bool source_truncated = false;
+    const char *start = agent_history_tail_start(
+        p, end, AGENT_HISTORY_ASSISTANT_MAX_LINES,
+        AGENT_HISTORY_ASSISTANT_MAX_BYTES, &source_truncated);
+    if (source_truncated)
+        agent_publish(w,
+            "\n... earlier assistant history truncated; showing tail ...\n",
+            strlen("\n... earlier assistant history truncated; showing tail ...\n"));
+
+    agent_tool_syntax tool_syntax = agent_tool_syntax_for_engine(w->engine);
+    agent_dsml_parser dsml = { .syntax = tool_syntax, .state = AGENT_DSML_SEARCH };
+    srv_stream s;
+    srv_stream_init(&s, &dsml, tool_syntax, w, srv_history_emit, w);
+    srv_stream_text(&s, start, (size_t)(end - start), true);
+    srv_stream_free(&s);
+    agent_dsml_parser_free(&dsml);
+}
+
+/* Copy of ds4_agent.c's agent_history_render_text with colour forced off (the
+ * client owns painting). */
+static void agent_history_render_text(agent_worker *w, const char *text,
+                                      size_t len, int user_turns) {
+    if (user_turns <= 0) return;
+    if (user_turns > AGENT_HISTORY_MAX_TURNS)
+        user_turns = AGENT_HISTORY_MAX_TURNS;
+
+    const char *end = text + len;
+    agent_history_render_compaction_summary(w, text, len);
+
+    bool tool_only = false;
+    const char *p = agent_history_start_for_turns(text, len, user_turns,
+                                                  &tool_only);
+    if (p >= end) {
+        agent_publish(w, "\n(no user history)\n", strlen("\n(no user history)\n"));
+        return;
+    }
+
+    agent_publish(w, "\n", 1);
+    if (tool_only) {
+        agent_publishf(w, "--- session history: recent tool/assistant events ---\n");
+    } else {
+        agent_publishf(w, "--- session history: last %d user turn%s ---\n",
+                       user_turns, user_turns == 1 ? "" : "s");
+    }
+
+    while (p < end) {
+        agent_history_mark mark = AGENT_HISTORY_MARK_NONE;
+        size_t mark_len = 0;
+        const char *m = agent_history_next_marker(p, end, &mark, &mark_len);
+        if (!m) break;
+        const char *content = m + mark_len;
+        agent_history_mark next_mark = AGENT_HISTORY_MARK_NONE;
+        size_t next_len = 0;
+        const char *next = agent_history_next_marker(content, end,
+                                                     &next_mark, &next_len);
+        const char *content_end = next ? next : end;
+        const char *tp = content, *te = content_end;
+        agent_history_trim(&tp, &te);
+
+        if (mark == AGENT_HISTORY_MARK_USER) {
+            if (agent_history_is_tool_user(tp, te)) {
+                const char *payload_start = tp;
+                const char *payload_end = te;
+                (void)agent_history_tool_result_payload(&payload_start,
+                                                        &payload_end);
+                agent_publish(w, "Tool result:\n", strlen("Tool result:\n"));
+                agent_history_publish_limited(w, payload_start, payload_end,
+                                              12, 3000);
+            } else {
+                agent_publish(w, "User:\n", strlen("User:\n"));
+                agent_history_publish_limited(w, tp, te, 24, 6000);
+            }
+        } else if (mark == AGENT_HISTORY_MARK_ASSISTANT) {
+            agent_publish(w, "Assistant:\n", strlen("Assistant:\n"));
+            agent_history_render_assistant(w, tp, te);
+        }
+        p = content_end;
+    }
+
+    agent_publish(w, "--- end history ---\n", strlen("--- end history ---\n"));
+}
+
+static bool agent_worker_show_history(agent_worker *w, int user_turns,
+                                      char *err, size_t err_len) {
+    if (!worker_is_idle(w)) {
+        snprintf(err, err_len, "model is busy");
+        return false;
+    }
+    size_t text_len = 0;
+    char *text = ds4_kvstore_render_tokens_text(w->engine, &w->transcript,
+                                                &text_len);
+    if (!text) {
+        snprintf(err, err_len, "failed to render session text");
+        return false;
+    }
+    agent_history_render_text(w, text, text_len, user_turns);
+    free(text);
+    return true;
+}
+
+/* -- /switch: load a saved session, report its identity ------------- */
+
+static bool agent_worker_switch_session(agent_worker *w, const char *prefix,
+                                        char sha_out[41], char **title_out,
+                                        int *ctx_used_out,
+                                        char *err, size_t err_len) {
+    if (title_out) *title_out = NULL;
+    if (ctx_used_out) *ctx_used_out = 0;
+    if (!worker_is_idle(w)) {
+        snprintf(err, err_len, "model is busy");
+        return false;
+    }
+    char sha[41];
+    char *path = NULL;
+    if (!agent_worker_find_session(w, prefix, sha, &path, err, err_len))
+        return false;
+
+    ds4_tokens loaded = {0};
+    agent_kv_session_meta meta = {0};
+    bool ok = agent_kv_load_path(w, path, sha, NULL, 0, &loaded, &meta,
+                                 err, err_len);
+    if (ok) {
+        agent_worker_images_clear(w);
+        ds4_tokens_free(&w->transcript);
+        w->transcript = loaded;
+        free(w->session_title);
+        w->session_title = meta.title ? xstrdup(meta.title)
+                                      : xstrdup("(no user prompt)");
+        w->session_created_at = meta.created_at ? meta.created_at
+                                                : (uint64_t)time(NULL);
+        memcpy(w->session_sha, sha, sizeof(w->session_sha));
+        free(w->legacy_session_path_to_delete);
+        w->legacy_session_path_to_delete =
+            meta.legacy_identity ? xstrdup(path) : NULL;
+        w->datetime_context_injected = true;
+        pthread_mutex_lock(&w->mu);
+        w->hints = (agent_hints){ .applied = AGENT_HINTS_UNKNOWN };
+        w->user_activity = true;
+        w->session_dirty = false;
+        w->status.state = AGENT_WORKER_IDLE;
+        w->status.ctx_used = w->transcript.len;
+        w->status.ctx_size = agent_worker_effective_ctx_size(w);
+        w->status.prefill_tps = 0.0;
+        w->status.greedy_sampling = false;
+        w->status.error[0] = '\0';
+        agent_wake_locked(w);
+        srv_status_publish_locked(w, true);
+        pthread_mutex_unlock(&w->mu);
+        if (sha_out) memcpy(sha_out, sha, 41);
+        if (title_out) *title_out = xstrdup(w->session_title);
+        if (ctx_used_out) *ctx_used_out = w->transcript.len;
+    } else {
+        ds4_tokens_free(&loaded);
+    }
+    agent_kv_session_meta_free(&meta);
+    free(path);
+    return ok;
+}
+
+/* -- SESSION list: ARR of MAP{sha,title,tokens,created_at,last_used,is_current} */
+
+static void server_session_list_encode(agent_worker *w, ap_buf *body) {
+    DIR *d = opendir(w->cache_dir);
+    agent_session_list_item *v = NULL;
+    int n = 0, cap = 0;
+    if (d) {
+        /* w->engine is always set in the server; NULL only in the Layer 3 test,
+         * where the model-id filter is skipped. */
+        const bool filter = w->engine != NULL;
+        const uint8_t model_id = filter ? (uint8_t)ds4_engine_model_id(w->engine) : 0;
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            char sha[41];
+            if (!ds4_kvstore_sha_hex_name(de->d_name, sha)) continue;
+            char *path = ds4_kvstore_path_join(w->cache_dir, de->d_name);
+            ds4_kvstore_entry e = {0};
+            if (ds4_kvstore_read_entry_file(path, sha, &e)) {
+                if (!filter || e.model_id == model_id) {
+                    char *title = agent_session_title_from_file(path, 160);
+                    agent_session_list_push(&v, &n, &cap, e, title);
+                } else {
+                    ds4_kvstore_entry_free(&e);
+                }
+            }
+            free(path);
+        }
+        closedir(d);
+        qsort(v, (size_t)n, sizeof(v[0]), agent_session_list_cmp_recent);
+    }
+
+    ap_put_reply_arr_begin(body, (uint32_t)n);
+    for (int i = 0; i < n; i++) {
+        const ds4_kvstore_entry *e = &v[i].entry;
+        ap_map_writer mw;
+        ap_map_begin(&mw, body);
+        ap_map_put_cstr(&mw, "sha", e->sha);
+        ap_map_put_cstr(&mw, "title", v[i].title ? v[i].title : "");
+        ap_map_put_u32(&mw, "tokens", e->tokens);
+        ap_map_put_i64(&mw, "created_at", (long long)e->created_at);
+        ap_map_put_i64(&mw, "last_used", (long long)e->last_used);
+        ap_map_put_bool(&mw, "is_current",
+                        w->session_sha[0] && strcmp(w->session_sha, e->sha) == 0);
+        ap_map_end(&mw);
+    }
+    agent_session_list_free(v, n);
 }
 
 /* ========================================================================= */
