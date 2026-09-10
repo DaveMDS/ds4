@@ -489,6 +489,15 @@ typedef enum {
     AGENT_TOOL_SYNTAX_GLM,
 } agent_tool_syntax;
 
+/* One pre-encoded server -> client frame waiting in the worker's output FIFO
+ * (T6): a single in-order queue drained by the connection's writer thread. */
+typedef struct srv_msg {
+    struct srv_msg *next;
+    uint32_t type;      /* enum agent_msg */
+    ap_buf body;        /* the frame payload, already encoded */
+    bool status_forced; /* STATUS only: a transition/error, never coalesced away */
+} srv_msg;
+
 /* Trimmed copy of ds4_agent.c's agent_worker: no web, bash, more-cursor,
  * linenoise or raw-mode fields (those live on the client). */
 typedef struct {
@@ -534,6 +543,17 @@ typedef struct {
     bool datetime_context_injected;
     agent_hints hints;
     int last_system_prompt_reminder_at;
+
+    /* Server -> client message FIFO (T6). The worker thread and the reader
+     * thread fill it under w->mu; the single writer thread drains it while a
+     * client connection owns the link. STATUS frames coalesce at the tail. */
+    srv_msg *fifo_head;
+    srv_msg *fifo_tail;
+    pthread_cond_t out_cond;
+    bool out_active;       /* a client connection is attached */
+    bool out_writer_stop;  /* the connection handler asks the writer to finish */
+    uint32_t stream_seq;   /* monotonic STREAM stream_id within a connection */
+    double last_status_enq; /* now_sec() of the last non-coalesced STATUS */
 } agent_worker;
 
 typedef struct {
@@ -562,6 +582,13 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
 static char *agent_session_title_from_text(const char *text, size_t text_len,
                                            size_t max_bytes);
 static void *worker_main(void *arg);
+
+/* Output FIFO helpers (defined in the reader/writer section below). All assume
+ * w->mu is held. */
+static void srv_fifo_clear_locked(agent_worker *w);
+static void srv_status_publish_locked(agent_worker *w, bool forced);
+static void srv_fifo_push_stream_locked(agent_worker *w, uint32_t kind,
+                                        const char *text, size_t len);
 
 /* -- syntax helpers, effective ctx / think mode ------------------------- */
 
@@ -988,26 +1015,13 @@ static void agent_wake_locked(agent_worker *w) {
     (void)wr;
 }
 
-/* Queue rendered output for the UI thread.  The worker never writes directly
- * to the terminal, which keeps linenoise redraws serialized in one place. */
+/* Worker-side output. In the split there is no local terminal: plain text
+ * becomes a STREAM{NORMAL} fragment on the wire. Adjacent NORMAL fragments are
+ * coalesced with the streaming classifier's output by the FIFO. */
 static void agent_publish(agent_worker *w, const char *s, size_t n) {
     if (!n) return;
     pthread_mutex_lock(&w->mu);
-    if (w->out_len + n + 1 > w->out_cap) {
-        size_t cap = w->out_cap ? w->out_cap * 2 : 4096;
-        while (cap < w->out_len + n + 1) cap *= 2;
-        char *p = realloc(w->out, cap);
-        if (!p) {
-            pthread_mutex_unlock(&w->mu);
-            return;
-        }
-        w->out = p;
-        w->out_cap = cap;
-    }
-    memcpy(w->out + w->out_len, s, n);
-    w->out_len += n;
-    w->out[w->out_len] = '\0';
-    agent_wake_locked(w);
+    srv_fifo_push_stream_locked(w, AGENT_STREAM_NORMAL, s, n);
     pthread_mutex_unlock(&w->mu);
 }
 
@@ -1041,6 +1055,7 @@ static void agent_set_status(agent_worker *w, agent_worker_state state) {
     if (state != AGENT_WORKER_GENERATING)
         w->status.greedy_sampling = false;
     agent_wake_locked(w);
+    srv_status_publish_locked(w, true);
     pthread_mutex_unlock(&w->mu);
 }
 
@@ -1051,6 +1066,7 @@ static void agent_set_error(agent_worker *w, const char *msg) {
     w->status.greedy_sampling = false;
     snprintf(w->status.error, sizeof(w->status.error), "%s", msg ? msg : "unknown error");
     agent_wake_locked(w);
+    srv_status_publish_locked(w, true);
     pthread_mutex_unlock(&w->mu);
 }
 
@@ -1619,6 +1635,7 @@ static void worker_progress_cb(void *ud, const char *event, int current, int tot
     w->status.prefill_tps =
         done > 0 && elapsed > 0.0 ? (double)done / elapsed : 0.0;
     agent_wake_locked(w);
+    srv_status_publish_locked(w, false);
     pthread_mutex_unlock(&w->mu);
 }
 
@@ -1663,18 +1680,13 @@ static void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
     ds4_prompt_prefix_append(w->engine, out, &w->cfg->gen.prefix);
 }
 
+/* The "✦" notices become STREAM{SYSTEM} fragments; the client owns the marker
+ * glyph and colour. */
 static void agent_publish_system_status(agent_worker *w, const char *msg) {
-    if (w->cfg->non_interactive) return;
-    if (isatty(STDOUT_FILENO)) {
-        static const char marker[] = "\x1b[33m✦ \x1b[38;5;218m";
-        agent_publish(w, marker, sizeof(marker) - 1);
-        agent_publish(w, msg, strlen(msg));
-        agent_publish(w, "\x1b[0m\n", strlen("\x1b[0m\n"));
-    } else {
-        agent_publish(w, "✦ ", strlen("✦ "));
-        agent_publish(w, msg, strlen(msg));
-        agent_publish(w, "\n", 1);
-    }
+    if (!msg || !msg[0]) return;
+    pthread_mutex_lock(&w->mu);
+    srv_fifo_push_stream_locked(w, AGENT_STREAM_SYSTEM, msg, strlen(msg));
+    pthread_mutex_unlock(&w->mu);
 }
 
 static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
@@ -1918,6 +1930,7 @@ static void worker_apply_pending_power(agent_worker *w) {
     w->cfg->engine.power_percent = power;
     w->status.power_percent = power;
     agent_wake_locked(w);
+    srv_status_publish_locked(w, false);
     pthread_mutex_unlock(&w->mu);
 }
 
@@ -2167,6 +2180,7 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine,
     w->wake_fd[1] = -1;
     pthread_mutex_init(&w->mu, NULL);
     pthread_cond_init(&w->cond, NULL);
+    pthread_cond_init(&w->out_cond, NULL);
     w->status.state = AGENT_WORKER_IDLE;
     if (pipe(w->wake_fd) != 0) return -1;
     int old_flags;
@@ -2202,6 +2216,8 @@ static void agent_worker_free(agent_worker *w) {
     if (w->wake_fd[1] >= 0) close(w->wake_fd[1]);
     free(w->cmd_text);
     free(w->out);
+    srv_fifo_clear_locked(w); /* worker + writer threads are joined by now */
+    pthread_cond_destroy(&w->out_cond);
     pthread_cond_destroy(&w->cond);
     pthread_mutex_destroy(&w->mu);
 }
@@ -3480,10 +3496,19 @@ static void conn_trace(server_conn *co, const char *dir, uint32_t type, size_t l
     fflush(co->trace);
 }
 
+/* Frame and send one message. Returns false on a write error (dead socket) so
+ * the writer thread can tear the connection down. */
 static bool conn_send(server_conn *co, uint32_t type, const ap_buf *body) {
     ap_buf_reset(&co->scratch);
     if (!ap_frame_encode(&co->scratch, type, body)) return false;
-    write_all(co->fd, (const char *)co->scratch.data, co->scratch.len);
+    const char *p = (const char *)co->scratch.data;
+    size_t n = co->scratch.len;
+    while (n) {
+        ssize_t k = send(co->fd, p, n, 0);
+        if (k > 0) { p += (size_t)k; n -= (size_t)k; continue; }
+        if (k < 0 && errno == EINTR) continue;
+        return false;
+    }
     conn_trace(co, "->", type, body ? body->len : 0);
     return true;
 }
@@ -3528,6 +3553,334 @@ static conn_frame_result conn_recv(server_conn *co, uint32_t *type, ap_buf *payl
 }
 
 /* ========================================================================= */
+/* Server -> client message FIFO + the per-connection reader/writer threads.  */
+/*                                                                           */
+/* One in-order queue on the worker (filled under w->mu by the worker thread */
+/* and the reader thread), drained by a single writer thread while a client   */
+/* is attached. STATUS frames coalesce at the tail so a burst of prefill      */
+/* progress does not flood the link (Risk 1 / Risk 10). AGENT-SPLIT-PLAN.md.  */
+/* ========================================================================= */
+
+static void srv_msg_free(srv_msg *m) {
+    if (!m) return;
+    ap_buf_free(&m->body);
+    free(m);
+}
+
+static void srv_fifo_clear_locked(agent_worker *w) {
+    srv_msg *m = w->fifo_head;
+    while (m) {
+        srv_msg *next = m->next;
+        srv_msg_free(m);
+        m = next;
+    }
+    w->fifo_head = w->fifo_tail = NULL;
+}
+
+static void srv_fifo_append_locked(agent_worker *w, srv_msg *m) {
+    m->next = NULL;
+    if (w->fifo_tail) w->fifo_tail->next = m;
+    else w->fifo_head = m;
+    w->fifo_tail = m;
+    pthread_cond_signal(&w->out_cond);
+}
+
+static srv_msg *srv_fifo_pop_locked(agent_worker *w) {
+    srv_msg *m = w->fifo_head;
+    if (m) {
+        w->fifo_head = m->next;
+        if (!w->fifo_head) w->fifo_tail = NULL;
+    }
+    return m;
+}
+
+/* Enqueue a pre-encoded frame. Takes ownership of *body (moved; the caller's
+ * ap_buf is reset to empty). Dropped when no client is attached. */
+static void srv_fifo_push_locked(agent_worker *w, uint32_t type, ap_buf *body) {
+    if (!w->out_active) {
+        ap_buf_free(body);
+        ap_buf_init(body);
+        return;
+    }
+    srv_msg *m = xmalloc(sizeof(*m));
+    m->type = type;
+    m->status_forced = false;
+    m->body = *body;
+    ap_buf_init(body);
+    srv_fifo_append_locked(w, m);
+}
+
+static void srv_fifo_push(agent_worker *w, uint32_t type, ap_buf *body) {
+    pthread_mutex_lock(&w->mu);
+    srv_fifo_push_locked(w, type, body);
+    pthread_mutex_unlock(&w->mu);
+}
+
+static void srv_fifo_push_reply_err(agent_worker *w, uint32_t type,
+                                    const char *msg) {
+    ap_buf b;
+    ap_buf_init(&b);
+    ap_put_reply_err(&b, msg);
+    srv_fifo_push(w, type, &b);
+    ap_buf_free(&b);
+}
+
+static void srv_fifo_push_stream_locked(agent_worker *w, uint32_t kind,
+                                        const char *text, size_t len) {
+    if (!w->out_active || !len) return;
+    ap_stream s = {
+        .stream_id = ++w->stream_seq,
+        .kind = kind,
+        .text = text,
+        .text_len = len,
+    };
+    srv_msg *m = xmalloc(sizeof(*m));
+    m->type = AGENT_MSG_STREAM;
+    m->status_forced = false;
+    ap_buf_init(&m->body);
+    ap_encode_stream(&m->body, &s);
+    srv_fifo_append_locked(w, m);
+}
+
+static void srv_status_encode_locked(agent_worker *w, ap_buf *body) {
+    ap_status st = {0};
+    st.state = (uint32_t)w->status.state;
+    st.prefill_done = (uint32_t)(w->status.prefill_done < 0 ? 0 : w->status.prefill_done);
+    st.prefill_total = (uint32_t)(w->status.prefill_total < 0 ? 0 : w->status.prefill_total);
+    st.prefill_label = w->status.prefill_label;
+    st.prefill_tps = ap_centi_from_double(w->status.prefill_tps);
+    st.generated = (uint32_t)(w->status.generated < 0 ? 0 : w->status.generated);
+    st.gen_tps = ap_centi_from_double(w->status.gen_tps);
+    st.greedy_sampling = w->status.greedy_sampling;
+    st.ctx_used = (uint32_t)(w->transcript.len < 0 ? 0 : w->transcript.len);
+    st.ctx_size = (uint32_t)agent_worker_effective_ctx_size(w);
+    st.power_percent = (uint32_t)worker_status_power_locked(w);
+    snprintf(st.error, sizeof(st.error), "%s", w->status.error);
+    ap_encode_status(body, &st);
+}
+
+/* Enqueue a STATUS. `forced` frames (state transitions, errors, the turn ack)
+ * always land; otherwise a fresh STATUS is dropped unless ~150 ms have passed,
+ * but an un-sent STATUS already at the FIFO tail is refreshed in place so the
+ * client always sees the latest snapshot without reordering past a STREAM. */
+static void srv_status_publish_locked(agent_worker *w, bool forced) {
+    if (!w->out_active) return;
+    double now = now_sec();
+    /* Refresh an un-sent, non-forced STATUS already at the tail rather than
+     * queueing another one. A forced STATUS (transition/error) is never merged
+     * into or replaced by a later one. */
+    if (w->fifo_tail && w->fifo_tail->type == AGENT_MSG_STATUS &&
+        !w->fifo_tail->status_forced) {
+        ap_buf_reset(&w->fifo_tail->body);
+        srv_status_encode_locked(w, &w->fifo_tail->body);
+        w->last_status_enq = now;
+        return;
+    }
+    if (!forced && now - w->last_status_enq < 0.15) return;
+    w->last_status_enq = now;
+    srv_msg *m = xmalloc(sizeof(*m));
+    m->type = AGENT_MSG_STATUS;
+    m->status_forced = forced;
+    ap_buf_init(&m->body);
+    srv_status_encode_locked(w, &m->body);
+    srv_fifo_append_locked(w, m);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Reader-thread frame dispatch                                              */
+/* ------------------------------------------------------------------------- */
+
+typedef struct {
+    server_conn *co;
+    agent_worker *w;
+    server_config *cfg;
+    server_session *sess;
+    bool got_stop;
+} srv_conn_ctx;
+
+typedef enum {
+    SRV_DISPATCH_CONTINUE,
+    SRV_DISPATCH_STOP,   /* client sent STOP */
+    SRV_DISPATCH_CLOSE,  /* protocol violation: drop the connection */
+} srv_dispatch_result;
+
+static srv_dispatch_result srv_dispatch_session(srv_conn_ctx *c, ap_reader *r) {
+    agent_worker *w = c->w;
+    server_session *sess = c->sess;
+    server_config *cfg = c->cfg;
+    ap_session_msg m;
+    if (!ap_decode_session(r, &m)) {
+        srv_fifo_push_reply_err(w, AGENT_MSG_SESSION, "malformed SESSION");
+        return SRV_DISPATCH_CLOSE;
+    }
+    if (!m.subcmd_known) {
+        srv_fifo_push_reply_err(w, AGENT_MSG_SESSION, "unknown SESSION sub-command");
+        return SRV_DISPATCH_CONTINUE;
+    }
+    ap_buf body;
+    ap_buf_init(&body);
+    switch (m.subcmd) {
+    case AGENT_SESSION_NEW: {
+        server_session_begin_new(sess, cfg->gen.ctx_size);
+        char nerr[256] = {0};
+        if (!server_apply_session_new(w, cfg, &m.new_args, &sess->ready,
+                                      nerr, sizeof(nerr))) {
+            srv_fifo_push_reply_err(w, AGENT_MSG_SESSION,
+                                    nerr[0] ? nerr : "failed to start session");
+            break;
+        }
+        ap_encode_session_ready(&body, &sess->ready);
+        srv_fifo_push(w, AGENT_MSG_SESSION, &body);
+        break;
+    }
+    case AGENT_SESSION_RESUME: {
+        bool had_turn = sess->turn_in_progress;
+        if (!server_session_resume(sess)) {
+            srv_fifo_push_reply_err(w, AGENT_MSG_SESSION,
+                                    "no parked session to resume");
+            break;
+        }
+        if (had_turn) {
+            worker_clear_interrupt(w);
+            agent_worker_append_assistant_turn_end(w);
+        }
+        sess->ready.ctx_used = (uint32_t)w->transcript.len;
+        sess->ready.ctx_size = (uint32_t)agent_worker_effective_ctx_size(w);
+        sess->ready.distributed_route_ready = true;
+        sess->ready.state = AGENT_STATE_IDLE;
+        ap_encode_session_ready(&body, &sess->ready);
+        srv_fifo_push(w, AGENT_MSG_SESSION, &body);
+        break;
+    }
+    default:
+        /* save / switch / list / del / compact land in T7. */
+        srv_fifo_push_reply_err(w, AGENT_MSG_SESSION, "not implemented yet");
+        break;
+    }
+    ap_buf_free(&body);
+    return SRV_DISPATCH_CONTINUE;
+}
+
+static srv_dispatch_result srv_dispatch_frame(srv_conn_ctx *c, uint32_t type,
+                                              ap_buf *payload) {
+    agent_worker *w = c->w;
+    ap_reader r;
+    ap_reader_init(&r, payload->data, payload->len);
+
+    switch (type) {
+    case AGENT_MSG_STOP:
+        return SRV_DISPATCH_STOP;
+
+    case AGENT_MSG_TURN: {
+        ap_turn t;
+        if (!ap_decode_turn(&r, &t)) return SRV_DISPATCH_CLOSE;
+        /* Inline images (TURN.images[]) are wired in T6b. */
+        char *text = xstrndup(t.text ? t.text : "", t.text_len);
+        bool ok = worker_submit(w, text);
+        free(text);
+        pthread_mutex_lock(&w->mu);
+        if (!ok) {
+            snprintf(w->status.error, sizeof(w->status.error), "busy");
+            srv_status_publish_locked(w, true);
+            w->status.error[0] = '\0';
+        } else {
+            srv_status_publish_locked(w, true); /* PREFILL: the turn ack */
+        }
+        pthread_mutex_unlock(&w->mu);
+        return SRV_DISPATCH_CONTINUE;
+    }
+
+    case AGENT_MSG_INTERRUPT:
+        worker_interrupt(w);
+        return SRV_DISPATCH_CONTINUE;
+
+    case AGENT_MSG_CONFIG:
+        srv_fifo_push_reply_err(w, AGENT_MSG_CONFIG, "CONFIG lands in T7");
+        return SRV_DISPATCH_CONTINUE;
+
+    case AGENT_MSG_SESSION:
+        return srv_dispatch_session(c, &r);
+
+    case AGENT_MSG_TOOL_RESULT:
+    case AGENT_MSG_DRAIN_REPLY:
+        agent_trace(w, "reader: %s ignored (handshakes land in T6b)",
+                    ap_msg_name(type));
+        return SRV_DISPATCH_CONTINUE;
+
+    case AGENT_MSG_HELLO:
+        return SRV_DISPATCH_CLOSE; /* HELLO only at connect time */
+
+    default:
+        agent_trace(w, "reader: unexpected frame type %u", type);
+        return SRV_DISPATCH_CONTINUE;
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Reader / writer threads                                                   */
+/* ------------------------------------------------------------------------- */
+
+static void *srv_writer_main(void *arg) {
+    srv_conn_ctx *c = arg;
+    agent_worker *w = c->w;
+    for (;;) {
+        pthread_mutex_lock(&w->mu);
+        while (!w->fifo_head && !w->out_writer_stop)
+            pthread_cond_wait(&w->out_cond, &w->mu);
+        srv_msg *m = srv_fifo_pop_locked(w);
+        bool stop = w->out_writer_stop;
+        pthread_mutex_unlock(&w->mu);
+
+        if (m) {
+            bool ok = conn_send(c->co, m->type, &m->body);
+            srv_msg_free(m);
+            if (!ok) {
+                shutdown(c->co->fd, SHUT_RDWR); /* unblock the reader */
+                return NULL;
+            }
+            continue;
+        }
+        if (stop) return NULL;
+    }
+}
+
+static void *srv_reader_main(void *arg) {
+    srv_conn_ctx *c = arg;
+    agent_worker *w = c->w;
+    char err[256] = {0};
+    uint32_t type = 0;
+    ap_buf payload;
+    ap_buf_init(&payload);
+
+    for (;;) {
+        conn_frame_result fr = conn_recv(c->co, &type, &payload, err, sizeof(err));
+        if (fr == CONN_FRAME_CLOSED) break;
+        if (fr == CONN_FRAME_ERROR) {
+            if (c->co->trace) {
+                fprintf(c->co->trace, "!! reader: %s\n", err);
+                fflush(c->co->trace);
+            }
+            break;
+        }
+        srv_dispatch_result dr = srv_dispatch_frame(c, type, &payload);
+        if (dr == SRV_DISPATCH_STOP) { c->got_stop = true; break; }
+        if (dr == SRV_DISPATCH_CLOSE) break;
+    }
+    ap_buf_free(&payload);
+
+    /* A turn in flight when the socket drops is closed as an interrupt; the
+     * transcript is left at a well-formed boundary. run_server then parks. */
+    c->sess->turn_in_progress = !worker_is_idle(w);
+    if (c->sess->turn_in_progress) worker_interrupt(w);
+
+    pthread_mutex_lock(&w->mu);
+    w->out_writer_stop = true;
+    pthread_cond_signal(&w->out_cond);
+    pthread_mutex_unlock(&w->mu);
+    return NULL;
+}
+
+/* ========================================================================= */
 /* Connection handler                                                         */
 /* ========================================================================= */
 
@@ -3538,6 +3891,10 @@ typedef enum {
     SERVE_STOP,       /* client sent STOP: free the session, keep listening */
 } serve_result;
 
+/* Set while a client connection owns the worker, so the SIGINT handler can
+ * unblock the reader thread's recv(). */
+static volatile int g_active_conn_fd = -1;
+
 static serve_result serve_connection(server_conn *co, agent_worker *w,
                                      server_config *cfg, server_session *sess,
                                      bool busy) {
@@ -3547,7 +3904,7 @@ static serve_result serve_connection(server_conn *co, agent_worker *w,
     ap_buf_init(&payload);
     serve_result result = SERVE_DISCONNECT;
 
-    /* 1. HELLO handshake. */
+    /* 1. HELLO handshake, synchronous: no reader/writer threads yet. */
     conn_frame_result fr = conn_recv(co, &type, &payload, err, sizeof(err));
     if (fr != CONN_FRAME_OK) goto done;
     if (type != AGENT_MSG_HELLO) {
@@ -3580,87 +3937,43 @@ static serve_result serve_connection(server_conn *co, agent_worker *w,
         ap_buf body;
         ap_buf_init(&body);
         ap_encode_hello_reply(&body, &reply);
-        conn_send(co, AGENT_MSG_HELLO, &body);
+        bool sent = conn_send(co, AGENT_MSG_HELLO, &body);
         ap_buf_free(&body);
+        if (!sent) goto done;
     }
 
-    /* 2. Request loop. T4-T7 fill in TURN / CONFIG / TOOL_RESULT / the rest of
-     * the SESSION sub-commands; for now anything unimplemented replies ERR. */
-    for (;;) {
-        fr = conn_recv(co, &type, &payload, err, sizeof(err));
-        if (fr == CONN_FRAME_CLOSED) { result = SERVE_DISCONNECT; goto done; }
-        if (fr == CONN_FRAME_ERROR) {
-            if (co->trace) { fprintf(co->trace, "!! %s\n", err); fflush(co->trace); }
-            result = SERVE_DISCONNECT;
-            goto done;
-        }
+    /* 2. Run the reader + writer threads until the reader exits (disconnect,
+     * protocol error, or STOP). All later frames flow through the FIFO. */
+    {
+        pthread_mutex_lock(&w->mu);
+        srv_fifo_clear_locked(w);
+        w->out_writer_stop = false;
+        w->stream_seq = 0;
+        w->last_status_enq = 0.0;
+        w->out_active = true;
+        pthread_mutex_unlock(&w->mu);
+        g_active_conn_fd = co->fd;
 
-        if (type == AGENT_MSG_STOP) { result = SERVE_STOP; goto done; }
+        srv_conn_ctx ctx = { .co = co, .w = w, .cfg = cfg, .sess = sess,
+                             .got_stop = false };
+        pthread_t rt, wt;
+        bool rt_ok = pthread_create(&rt, NULL, srv_reader_main, &ctx) == 0;
+        bool wt_ok = pthread_create(&wt, NULL, srv_writer_main, &ctx) == 0;
+        if (rt_ok) pthread_join(rt, NULL);
 
-        if (type == AGENT_MSG_SESSION) {
-            ap_reader r;
-            ap_reader_init(&r, payload.data, payload.len);
-            ap_session_msg m;
-            if (!ap_decode_session(&r, &m)) {
-                conn_send_reply_err(co, AGENT_MSG_SESSION, "malformed SESSION");
-                result = SERVE_DISCONNECT;
-                goto done;
-            }
-            if (!m.subcmd_known) {
-                conn_send_reply_err(co, AGENT_MSG_SESSION, "unknown SESSION sub-command");
-                continue;
-            }
-            switch (m.subcmd) {
-                case AGENT_SESSION_NEW: {
-                    server_session_begin_new(sess, cfg->gen.ctx_size);
-                    char nerr[256] = {0};
-                    if (!server_apply_session_new(w, cfg, &m.new_args,
-                                                  &sess->ready, nerr, sizeof(nerr))) {
-                        conn_send_reply_err(co, AGENT_MSG_SESSION,
-                                            nerr[0] ? nerr : "failed to start session");
-                        break;
-                    }
-                    ap_buf body;
-                    ap_buf_init(&body);
-                    ap_encode_session_ready(&body, &sess->ready);
-                    conn_send(co, AGENT_MSG_SESSION, &body);
-                    ap_buf_free(&body);
-                    break;
-                }
-                case AGENT_SESSION_RESUME: {
-                    bool had_turn = sess->turn_in_progress;
-                    if (!server_session_resume(sess)) {
-                        conn_send_reply_err(co, AGENT_MSG_SESSION, "no parked session to resume");
-                        break;
-                    }
-                    /* A turn cut off by the disconnect: close it at a
-                     * well-formed IDLE boundary before the client re-enters. */
-                    if (had_turn) {
-                        worker_clear_interrupt(w);
-                        agent_worker_append_assistant_turn_end(w);
-                    }
-                    sess->ready.ctx_used = (uint32_t)w->transcript.len;
-                    sess->ready.ctx_size = (uint32_t)agent_worker_effective_ctx_size(w);
-                    sess->ready.distributed_route_ready = true;
-                    sess->ready.state = AGENT_STATE_IDLE;
-                    ap_buf body;
-                    ap_buf_init(&body);
-                    ap_encode_session_ready(&body, &sess->ready);
-                    conn_send(co, AGENT_MSG_SESSION, &body);
-                    ap_buf_free(&body);
-                    break;
-                }
-                default:
-                    conn_send_reply_err(co, AGENT_MSG_SESSION, "not implemented yet");
-                    break;
-            }
-            continue;
-        }
+        pthread_mutex_lock(&w->mu);
+        w->out_writer_stop = true;
+        pthread_cond_signal(&w->out_cond);
+        pthread_mutex_unlock(&w->mu);
+        if (wt_ok) pthread_join(wt, NULL);
 
-        if (co->trace) {
-            fprintf(co->trace, "?? unhandled %s (T4-T7)\n", ap_msg_name(type));
-            fflush(co->trace);
-        }
+        g_active_conn_fd = -1;
+        pthread_mutex_lock(&w->mu);
+        w->out_active = false;
+        srv_fifo_clear_locked(w);
+        pthread_mutex_unlock(&w->mu);
+
+        result = ctx.got_stop ? SERVE_STOP : SERVE_DISCONNECT;
     }
 
 done:
@@ -3680,6 +3993,7 @@ static void server_sigint_handler(int sig) {
     g_shutdown = 1;
     if (g_listen_fd >= 0) close(g_listen_fd);
     g_listen_fd = -1;
+    if (g_active_conn_fd >= 0) shutdown(g_active_conn_fd, SHUT_RDWR);
 }
 
 static int server_listen(const char *host, int port) {

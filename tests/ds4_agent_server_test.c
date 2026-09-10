@@ -372,6 +372,180 @@ static void test_stream_greedy_sampling_flag(void) {
     cap_free(&c);
 }
 
+/* ---- T6a: server -> client FIFO, STATUS packing, reader dispatch ------- */
+
+static server_config g_fake_cfg;
+
+/* A worker with just the sync primitives + config the FIFO/dispatch paths
+ * touch. No engine, no session, no worker thread. */
+static void fake_worker(agent_worker *w) {
+    memset(w, 0, sizeof(*w));
+    pthread_mutex_init(&w->mu, NULL);
+    pthread_cond_init(&w->cond, NULL);
+    pthread_cond_init(&w->out_cond, NULL);
+    memset(&g_fake_cfg, 0, sizeof(g_fake_cfg));
+    g_fake_cfg.gen.ctx_size = 8192;
+    w->cfg = &g_fake_cfg;
+    w->wake_fd[0] = w->wake_fd[1] = -1;
+    w->status.state = AGENT_WORKER_IDLE;
+    w->initialized = true;
+    w->out_active = true;
+}
+
+static void fake_worker_destroy(agent_worker *w) {
+    srv_fifo_clear_locked(w);
+    pthread_cond_destroy(&w->out_cond);
+    pthread_cond_destroy(&w->cond);
+    pthread_mutex_destroy(&w->mu);
+}
+
+static size_t fifo_count(const agent_worker *w) {
+    size_t n = 0;
+    for (const srv_msg *m = w->fifo_head; m; m = m->next) n++;
+    return n;
+}
+
+static void test_srv_status_packing(void) {
+    agent_worker w;
+    fake_worker(&w);
+    w.status.state = AGENT_WORKER_GENERATING;
+    w.status.generated = 42;
+    w.status.gen_tps = 12.5;
+    w.status.greedy_sampling = true;
+    w.transcript.len = 1000;
+
+    pthread_mutex_lock(&w.mu);
+    srv_status_publish_locked(&w, true);
+    pthread_mutex_unlock(&w.mu);
+    CHECK(fifo_count(&w) == 1);
+    CHECK(w.fifo_head->type == AGENT_MSG_STATUS);
+
+    ap_reader r;
+    ap_reader_init(&r, w.fifo_head->body.data, w.fifo_head->body.len);
+    ap_status st;
+    CHECK(ap_decode_status(&r, &st));
+    CHECK(st.state == AGENT_STATE_GENERATING);
+    CHECK(st.generated == 42);
+    CHECK(st.greedy_sampling == true);
+    CHECK(st.ctx_used == 1000);
+    CHECK(st.ctx_size == 8192);
+    CHECK(ap_centi_to_double(st.gen_tps) > 12.4 && ap_centi_to_double(st.gen_tps) < 12.6);
+
+    fake_worker_destroy(&w);
+}
+
+static void test_srv_status_coalesce(void) {
+    agent_worker w;
+    fake_worker(&w);
+    struct timespec pause = {0, 200 * 1000 * 1000}; /* > the 150ms rate gate */
+
+    pthread_mutex_lock(&w.mu);
+    srv_status_publish_locked(&w, true);
+    srv_status_publish_locked(&w, true);
+    CHECK(fifo_count(&w) == 2); /* forced STATUS is never merged */
+    pthread_mutex_unlock(&w.mu);
+
+    nanosleep(&pause, NULL);
+    pthread_mutex_lock(&w.mu);
+    w.status.generated = 3;
+    srv_status_publish_locked(&w, false); /* rate gate passed -> non-forced node */
+    CHECK(fifo_count(&w) == 3);
+
+    w.status.generated = 9;
+    srv_status_publish_locked(&w, false); /* tail is non-forced STATUS -> in place */
+    CHECK(fifo_count(&w) == 3);
+
+    srv_fifo_push_stream_locked(&w, AGENT_STREAM_NORMAL, "x", 1);
+    CHECK(fifo_count(&w) == 4);
+
+    srv_status_publish_locked(&w, false); /* tail is STREAM, rate-gated -> dropped */
+    CHECK(fifo_count(&w) == 4);
+    pthread_mutex_unlock(&w.mu);
+
+    /* the refreshed non-forced STATUS (node index 2) carries the latest state */
+    ap_reader r;
+    ap_reader_init(&r, w.fifo_head->next->next->body.data,
+                   w.fifo_head->next->next->body.len);
+    ap_status st;
+    CHECK(ap_decode_status(&r, &st));
+    CHECK(st.generated == 9);
+
+    fake_worker_destroy(&w);
+}
+
+static void test_srv_dispatch_turn(void) {
+    agent_worker w;
+    fake_worker(&w);
+    srv_conn_ctx c = { .w = &w };
+
+    ap_buf body;
+    ap_buf_init(&body);
+    ap_turn t = { .text = "do the thing", .text_len = 12 };
+    ap_encode_turn(&body, &t);
+
+    srv_dispatch_result dr = srv_dispatch_frame(&c, AGENT_MSG_TURN, &body);
+    CHECK(dr == SRV_DISPATCH_CONTINUE);
+    CHECK(w.cmd_text && strcmp(w.cmd_text, "do the thing") == 0);
+    CHECK(w.status.state == AGENT_WORKER_PREFILL);
+    /* the PREFILL ack STATUS was enqueued */
+    CHECK(fifo_count(&w) >= 1);
+    CHECK(w.fifo_tail->type == AGENT_MSG_STATUS);
+
+    ap_buf_free(&body);
+    free(w.cmd_text);
+    fake_worker_destroy(&w);
+}
+
+static void test_srv_dispatch_stop_interrupt(void) {
+    agent_worker w;
+    fake_worker(&w);
+    srv_conn_ctx c = { .w = &w };
+    ap_buf empty;
+    ap_buf_init(&empty);
+
+    CHECK(srv_dispatch_frame(&c, AGENT_MSG_STOP, &empty) == SRV_DISPATCH_STOP);
+
+    CHECK(srv_dispatch_frame(&c, AGENT_MSG_INTERRUPT, &empty) == SRV_DISPATCH_CONTINUE);
+    CHECK(w.interrupt == true);
+
+    CHECK(srv_dispatch_frame(&c, AGENT_MSG_HELLO, &empty) == SRV_DISPATCH_CLOSE);
+
+    ap_buf_free(&empty);
+    fake_worker_destroy(&w);
+}
+
+static void test_srv_publish_stream(void) {
+    agent_worker w;
+    fake_worker(&w);
+
+    agent_publish_system_status(&w, "building sysprompt");
+    agent_publish(&w, "plain output", 12);
+    CHECK(fifo_count(&w) == 2);
+
+    ap_reader r;
+    ap_reader_init(&r, w.fifo_head->body.data, w.fifo_head->body.len);
+    ap_stream s;
+    CHECK(ap_decode_stream(&r, &s));
+    CHECK(s.kind == AGENT_STREAM_SYSTEM);
+    CHECK(s.text_len == strlen("building sysprompt"));
+    CHECK(memcmp(s.text, "building sysprompt", s.text_len) == 0);
+    CHECK(s.stream_id == 1);
+
+    ap_reader_init(&r, w.fifo_head->next->body.data, w.fifo_head->next->body.len);
+    CHECK(ap_decode_stream(&r, &s));
+    CHECK(s.kind == AGENT_STREAM_NORMAL && s.stream_id == 2);
+
+    /* nothing is enqueued once the client detaches */
+    pthread_mutex_lock(&w.mu);
+    w.out_active = false;
+    srv_fifo_clear_locked(&w);
+    pthread_mutex_unlock(&w.mu);
+    agent_publish(&w, "dropped", 7);
+    CHECK(fifo_count(&w) == 0);
+
+    fake_worker_destroy(&w);
+}
+
 int main(void) {
     test_parse_defaults();
     test_parse_engine_flags();
@@ -388,6 +562,11 @@ int main(void) {
     test_stream_normal_coalesced();
     test_stream_invalid_tool_call_notice();
     test_stream_greedy_sampling_flag();
+    test_srv_status_packing();
+    test_srv_status_coalesce();
+    test_srv_dispatch_turn();
+    test_srv_dispatch_stop_interrupt();
+    test_srv_publish_stream();
 
     if (failures) {
         fprintf(stderr, "%d agent server test(s) failed\n", failures);
