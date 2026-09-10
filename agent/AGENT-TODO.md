@@ -14,7 +14,7 @@ legend: [ ] todo  [>] in progress  [x] done
 - [x] 3. Server skeleton
 - [x] 4. Tools framework (client-side): header + one file per group
 - [x] 5. Client skeleton + mock-server harness (Layer 2)
-- [>] 6. Makefile targets + build/test integration
+- [x] 6. Makefile targets + build/test integration
 - [ ] 7. Real inference e2e (only with user, RAM/CUDA host)
 
 
@@ -78,6 +78,12 @@ STATUS: verify rendered output, messages sent, tool execution + fit-context
 Targets `ds4-agent-server` (server.o + ds4.o + ds4_kvstore.o + engine objects)
 and `ds4-agent-client` (client.o + tools + ds4_web.o + linenoise.o). Do not
 break existing targets. `make` green, `make test` green.
+
+DONE: `ds4-agent-client` target (Darwin/ROCm/cpu + `$(MAKE) -B` lists),
+`ds4_agent_client_test` wired into `make test`, clean/help/.gitignore updated.
+`make` green; `ds4_agent_proto/server/tools/client_test` all green; `test`
+target parses. Full `make test` needs CUDA CORE_OBJS (pre-existing on this
+box) — final verification deferred to Task 7's CUDA host.
 
 
 ## Task 7 — Real inference e2e
