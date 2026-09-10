@@ -96,4 +96,53 @@ static inline float parse_float_range(const char *s, const char *opt, float min,
     return v;
 }
 
+/* ============================================================================
+ * agent_buf -- dynamic string buffer (server prompt/title/persistence building,
+ * client tool output)
+ * ========================================================================== */
+
+typedef struct {
+    char *ptr;
+    size_t len;
+    size_t cap;
+    size_t limit;
+    bool truncated;
+} agent_buf;
+
+static inline void agent_buf_append(agent_buf *b, const char *s, size_t n) {
+    if (!n || b->truncated) return;
+    const size_t max = b->limit ? b->limit : SIZE_MAX - 1;
+    if (n > max - b->len) {
+        n = max > b->len ? max - b->len : 0;
+        while (n && ((unsigned char)s[n] & 0xc0) == 0x80) n--;
+        b->truncated = true;
+    }
+    if (!n) return;
+    if (b->len + n + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap * 2 : 4096;
+        while (cap < b->len + n + 1) cap *= 2;
+        b->ptr = xrealloc(b->ptr, cap);
+        b->cap = cap;
+    }
+    memcpy(b->ptr + b->len, s, n);
+    b->len += n;
+    b->ptr[b->len] = '\0';
+}
+
+static inline void agent_buf_puts(agent_buf *b, const char *s) {
+    agent_buf_append(b, s, strlen(s));
+}
+
+static inline char *agent_buf_take(agent_buf *b) {
+    if (b->truncated) {
+        b->truncated = false;
+        b->limit = 0;
+        agent_buf_puts(b, "\n[Output truncated at the tool byte limit. Narrow the request.]\n");
+    }
+    if (!b->ptr) return xstrdup("");
+    char *p = b->ptr;
+    memset(b, 0, sizeof(*b));
+    return p;
+}
+
 #endif /* DS4_AGENT_UTILS_H */

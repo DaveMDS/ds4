@@ -3,6 +3,7 @@
 /ds4-bench
 /ds4-eval
 /ds4-agent
+/ds4-agent-server
 /ds4_native
 /ds4_agent_test
 /ds4_server_test
