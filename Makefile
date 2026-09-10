@@ -74,12 +74,12 @@ ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
 .PHONY: test-metal-moe-prefill test-metal-dense-mpp
 
-all: ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-agent-server
+all: ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-agent-server ds4-agent-client
 
 help:
 	@echo "DS4 build targets:"
-	@echo "  make              Build Metal ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, ./ds4-agent, and ./ds4-agent-server"
-	@echo "  make cpu          Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, ./ds4-agent, and ./ds4-agent-server"
+	@echo "  make              Build Metal ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, ./ds4-agent, ./ds4-agent-server, and ./ds4-agent-client"
+	@echo "  make cpu          Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, ./ds4-agent, ./ds4-agent-server, and ./ds4-agent-client"
 	@echo "  make test         Build and run tests"
 	@echo "  make metal-decode-schedule-bench  Build the balanced Metal decode schedule benchmark"
 	@echo "  make metal-prefill-variant-bench  Build the balanced Metal prefill variant benchmark"
@@ -106,6 +106,14 @@ ds4-agent: ds4_agent.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o li
 
 ds4-agent-server: ds4_agent_server.o ds4_kvstore.o ds4_prompt_prefix.o ds4_gpu_args.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_agent_server.o ds4_kvstore.o ds4_prompt_prefix.o ds4_gpu_args.o $(CORE_OBJS) $(METAL_LDLIBS)
+
+ds4-agent-client: agent/ds4_agent_client.c agent/ds4_agent_tools.h \
+	agent/ds4_agent_tools_file.c agent/ds4_agent_tools_bash.c \
+	agent/ds4_agent_tools_web.c agent/ds4_agent_tools_dispatch.c \
+	agent/ds4_agent_proto.h agent/ds4_agent_utils.h ds4_web.o linenoise.o
+	$(CC) $(CFLAGS) -I. -Iagent -pthread -o $@ agent/ds4_agent_client.c \
+	agent/ds4_agent_tools_file.c agent/ds4_agent_tools_bash.c \
+	agent/ds4_agent_tools_web.c agent/ds4_agent_tools_dispatch.c ds4_web.o linenoise.o
 
 gguf-tools/quality-testing/score_official: gguf-tools/quality-testing/score_official.c ds4.h ds4_distributed.h ds4_tp.h $(CORE_OBJS) rax.o ds4_gpu_args.o
 	$(CC) $(QUALITY_CFLAGS) -I. -o $@ gguf-tools/quality-testing/score_official.c $(CORE_OBJS) rax.o ds4_gpu_args.o $(METAL_LDLIBS)
@@ -188,6 +196,9 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_eval_case
 	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o ds4_eval_cases.o ds4_help.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent ds4_agent_cpu.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent-server ds4_agent_server_cpu.o ds4_kvstore.o ds4_prompt_prefix.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -I. -Iagent -pthread -o ds4-agent-client agent/ds4_agent_client.c \
+	agent/ds4_agent_tools_file.c agent/ds4_agent_tools_bash.c \
+	agent/ds4_agent_tools_web.c agent/ds4_agent_tools_dispatch.c ds4_web.o linenoise.o
 
 cuda-regression:
 	@echo "cuda-regression requires a CUDA build"
@@ -203,17 +214,17 @@ help:
 	@echo "  make rocm                Alias for make strix-halo"
 	@echo "  make test-mxfp4-rocm     Build and run the synthetic ROCm MXFP4 MoE test"
 	@echo "  make test-rocm           Core regression suite on ROCm-only hosts"
-	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
+	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, ./ds4-agent, and ./ds4-agent-client"
 	@echo "  make test                Build and run tests"
 	@echo "  make dspark-verify-depth Run DSpark speculative verification smoke if support GGUF is present"
 	@echo "  make mtp-verify-depth    Run legacy MTP speculative verification smoke if MTP GGUF is present"
 	@echo "  make clean               Remove build outputs"
 
 cuda-spark:
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-agent-server CUDA_ARCH=sm_121
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-agent-server ds4-agent-client CUDA_ARCH=sm_121
 
 cuda-generic:
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-agent-server CUDA_ARCH=native
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-agent-server ds4-agent-client CUDA_ARCH=native
 
 cuda:
 	@if [ -z "$(strip $(CUDA_ARCH))" ]; then \
@@ -221,10 +232,10 @@ cuda:
 		echo "       or use make cuda-spark / make cuda-generic"; \
 		exit 2; \
 	fi
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-agent-server CUDA_ARCH="$(CUDA_ARCH)"
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-agent-server ds4-agent-client CUDA_ARCH="$(CUDA_ARCH)"
 
 strix-halo:
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-agent-server \
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-agent-server ds4-agent-client \
 		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o $(ROCM_MMQ_OBJS)" \
 		CFLAGS="$(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
@@ -272,6 +283,14 @@ ds4-agent: ds4_agent.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o li
 ds4-agent-server: ds4_agent_server.o ds4_kvstore.o ds4_prompt_prefix.o ds4_gpu_args.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
+ds4-agent-client: agent/ds4_agent_client.c agent/ds4_agent_tools.h \
+	agent/ds4_agent_tools_file.c agent/ds4_agent_tools_bash.c \
+	agent/ds4_agent_tools_web.c agent/ds4_agent_tools_dispatch.c \
+	agent/ds4_agent_proto.h agent/ds4_agent_utils.h ds4_web.o linenoise.o
+	$(CC) $(CFLAGS) -I. -Iagent -pthread -o $@ agent/ds4_agent_client.c \
+	agent/ds4_agent_tools_file.c agent/ds4_agent_tools_bash.c \
+	agent/ds4_agent_tools_web.c agent/ds4_agent_tools_dispatch.c ds4_web.o linenoise.o
+
 gguf-tools/quality-testing/score_official.o: gguf-tools/quality-testing/score_official.c ds4.h
 	$(CC) $(filter-out -ffast-math,$(QUALITY_CFLAGS)) $(ROCM_HOST_CFLAGS) -I. -c -o $@ $<
 
@@ -305,6 +324,9 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_eval_case
 	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o ds4_eval_cases.o ds4_help.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent ds4_agent_cpu.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent-server ds4_agent_server_cpu.o ds4_kvstore.o ds4_prompt_prefix.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -I. -Iagent -pthread -o ds4-agent-client agent/ds4_agent_client.c \
+	agent/ds4_agent_tools_file.c agent/ds4_agent_tools_bash.c \
+	agent/ds4_agent_tools_web.c agent/ds4_agent_tools_dispatch.c ds4_web.o linenoise.o
 
 cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
@@ -721,7 +743,7 @@ test-frontends: ds4_test ds4_agent_test
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-state test-linux-memory \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 	tests/test_deepseek4_vision_image tests/test_prompt_prefix $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent ds4-agent-server \
-	ds4_agent_proto_test ds4_agent_server_test ds4_agent_tools_test
+	ds4_agent_proto_test ds4_agent_server_test ds4_agent_tools_test ds4_agent_client_test
 	./ds4-eval --validate-cases
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
@@ -736,6 +758,7 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-
 	./tests/ds4_agent_proto_test
 	./tests/ds4_agent_server_test
 	./tests/ds4_agent_tools_test
+	./tests/ds4_agent_client_test
 
 dspark-acceptance: ds4
 	DS4_DSPARK_MODEL="$(DS4_DSPARK_MODEL)" \
@@ -786,6 +809,16 @@ ds4_agent_tools_test: tests/ds4_agent_tools_test.c agent/ds4_agent_tools.h \
 	agent/ds4_agent_tools_web.c agent/ds4_agent_tools_dispatch.c ds4_web.o
 	./tests/ds4_agent_tools_test
 
+ds4_agent_client_test: agent/ds4_agent_client.c agent/ds4_agent_tools.h \
+	agent/ds4_agent_tools_file.c agent/ds4_agent_tools_bash.c \
+	agent/ds4_agent_tools_web.c agent/ds4_agent_tools_dispatch.c \
+	agent/ds4_agent_proto.h agent/ds4_agent_utils.h ds4_web.o linenoise.o
+	$(CC) -O2 -Wall -Wextra -std=c99 -D_GNU_SOURCE -DDS4_AGENT_TEST -I. -Iagent -pthread \
+	-o tests/ds4_agent_client_test agent/ds4_agent_client.c \
+	agent/ds4_agent_tools_file.c agent/ds4_agent_tools_bash.c \
+	agent/ds4_agent_tools_web.c agent/ds4_agent_tools_dispatch.c ds4_web.o linenoise.o
+	./tests/ds4_agent_client_test
+
 
 mxfp4-dot-test: tests/test_mxfp4_dot.c
 	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/test_mxfp4_dot tests/test_mxfp4_dot.c -lm
@@ -812,4 +845,4 @@ clean:
 	rm -f tests/test_ssd_cache
 	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tp_commands
 	rm -f tests/test_metal_tp_spec
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-agent-server ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-agent-server ds4-agent-client ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/ds4_agent_client_test tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

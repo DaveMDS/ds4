@@ -13,8 +13,8 @@ legend: [ ] todo  [>] in progress  [x] done
 - [x] 2. Port DSML/GLM parser + marker/think trackers into ds4_agent_server.c
 - [x] 3. Server skeleton
 - [x] 4. Tools framework (client-side): header + one file per group
-- [ ] 5. Client skeleton + mock-server harness (Layer 2)
-- [ ] 6. Makefile targets + build/test integration
+- [x] 5. Client skeleton + mock-server harness (Layer 2)
+- [>] 6. Makefile targets + build/test integration
 - [ ] 7. Real inference e2e (only with user, RAM/CUDA host)
 
 
