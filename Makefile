@@ -721,7 +721,7 @@ test-frontends: ds4_test ds4_agent_test
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-state test-linux-memory \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 	tests/test_deepseek4_vision_image tests/test_prompt_prefix $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent ds4-agent-server \
-	ds4_agent_proto_test ds4_agent_server_test
+	ds4_agent_proto_test ds4_agent_server_test ds4_agent_tools_test
 	./ds4-eval --validate-cases
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
@@ -735,6 +735,7 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-
 	./tests/test_deepseek4_vision_image
 	./tests/ds4_agent_proto_test
 	./tests/ds4_agent_server_test
+	./tests/ds4_agent_tools_test
 
 dspark-acceptance: ds4
 	DS4_DSPARK_MODEL="$(DS4_DSPARK_MODEL)" \
@@ -774,6 +775,17 @@ ds4_agent_server_test: tests/ds4_agent_server_test.c agent/ds4_agent_server.c \
 	$(CC) -O2 -Wall -Wextra -std=c99 -D_GNU_SOURCE -Wno-unused-function -I. \
 	-o tests/ds4_agent_server_test tests/ds4_agent_server_test.c
 	./tests/ds4_agent_server_test
+
+ds4_agent_tools_test: tests/ds4_agent_tools_test.c agent/ds4_agent_tools.h \
+	agent/ds4_agent_tools_file.c agent/ds4_agent_tools_bash.c \
+	agent/ds4_agent_tools_web.c agent/ds4_agent_tools_dispatch.c \
+	agent/ds4_agent_proto.h agent/ds4_agent_utils.h ds4_web.o
+	$(CC) -O2 -Wall -Wextra -std=c99 -D_GNU_SOURCE -I. -pthread \
+	-o tests/ds4_agent_tools_test tests/ds4_agent_tools_test.c \
+	agent/ds4_agent_tools_file.c agent/ds4_agent_tools_bash.c \
+	agent/ds4_agent_tools_web.c agent/ds4_agent_tools_dispatch.c ds4_web.o
+	./tests/ds4_agent_tools_test
+
 
 mxfp4-dot-test: tests/test_mxfp4_dot.c
 	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/test_mxfp4_dot tests/test_mxfp4_dot.c -lm

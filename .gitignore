@@ -50,6 +50,7 @@
 /tests/test_deepseek4_vision_image
 /tests/ds4_agent_proto_test
 /tests/ds4_agent_server_test
+/tests/ds4_agent_tools_test
 *.o
 *.dSYM/
 __pycache__/
