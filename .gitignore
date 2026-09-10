@@ -6,6 +6,8 @@
 /ds4_native
 /ds4_agent_test
 /ds4_agent_proto_test
+/ds4_agent_server_test
+/ds4-agent-server
 /ds4_server_test
 /ds4_test
 /ds4flash.gguf

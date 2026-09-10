@@ -107,6 +107,7 @@ static const char *tool_name(ds4_help_tool tool) {
     case DS4_HELP_AGENT: return "ds4-agent";
     case DS4_HELP_BENCH: return "ds4-bench";
     case DS4_HELP_EVAL: return "ds4-eval";
+    case DS4_HELP_AGENT_SERVER: return "ds4-agent-server";
     }
     return "ds4";
 }
@@ -123,6 +124,8 @@ static const char *tool_usage(ds4_help_tool tool) {
         return "Usage: ds4-bench (--prompt-file FILE | --chat-prompt-file FILE) [options]";
     case DS4_HELP_EVAL:
         return "Usage: ds4-eval [options]";
+    case DS4_HELP_AGENT_SERVER:
+        return "Usage: ds4-agent-server -m MODEL [options]";
     }
     return "Usage: ds4 [options]";
 }
@@ -139,6 +142,8 @@ static const char *tool_summary(ds4_help_tool tool) {
         return "Measure prefill, decode, context growth, and KV-cache size across repeatable context frontiers.";
     case DS4_HELP_EVAL:
         return "Run the built-in reasoning, math, science, and security evaluation harness with a live terminal UI.";
+    case DS4_HELP_AGENT_SERVER:
+        return "Run the inference half of the ds4-agent split: load the model and serve one ds4-agent-client over a framed TCP link.";
     }
     return "";
 }
@@ -147,7 +152,8 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
                                 ds4_help_tool tool, bool full) {
     title(fp, c, "Model And Runtime");
     opt(fp, c, "-m, --model FILE", "GGUF model path. Default: ds4flash.gguf");
-    if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
+    if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER ||
+        tool == DS4_HELP_AGENT_SERVER) {
         opt(fp, c, "--vision FILE", "Vision encoder GGUF for the selected model.");
     }
 #ifdef DS4_ROCM_BUILD
@@ -181,7 +187,8 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
         if (tool == DS4_HELP_EVAL || tool == DS4_HELP_BENCH) {
             opt(fp, c, "--mtp-model FILE", "External MTP or DSpark support GGUF.");
         }
-        if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
+        if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER ||
+            tool == DS4_HELP_AGENT_SERVER) {
             opt(fp, c, "--mtp", "Enable model-embedded MTP speculation.");
             opt(fp, c, "--mtp-model FILE", "External MTP or DSpark support GGUF.");
             opt(fp, c, "--mtp-draft N", "Maximum autoregressive MTP draft tokens. Default: 1");
@@ -339,6 +346,16 @@ static void print_agent_sessions(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
 }
 
+static void print_agent_server_specific(FILE *fp, const help_colors *c) {
+    title(fp, c, "Agent Server Options");
+    opt(fp, c, "--host HOST", "Bind address. Default: 127.0.0.1");
+    opt(fp, c, "--port N", "Bind port. Default: 7878");
+    opt(fp, c, "--trace FILE", "Write a protocol/token debug trace on the server side.");
+    para(fp, c, "Plaintext TCP with no authentication: whoever reaches the port gets inference and access to the on-disk KV store. Keep the default 127.0.0.1 bind and reach the server across machines only over an SSH tunnel or a trusted VPN. --host 0.0.0.0 is possible but exposes the model and KV cache to the network.");
+    para(fp, c, "Sampling, thinking, seed, hints, and the extra system prompt are ds4-agent-client options; the client sends them when it starts a session. The engine instance lock still applies: ds4-agent-server cannot share a host with a running ds4-agent or ds4-server.");
+    fputc('\n', fp);
+}
+
 static void print_server_api(FILE *fp, const help_colors *c) {
     title(fp, c, "HTTP API");
     opt(fp, c, "--host HOST", "Bind address. Default: 127.0.0.1");
@@ -426,7 +443,8 @@ static bool tool_has_topic(ds4_help_tool tool, const char *topic) {
     if (streq(topic, "sampling"))
         return tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_EVAL;
     if (streq(topic, "steering"))
-        return tool == DS4_HELP_DS4 || tool == DS4_HELP_SERVER || tool == DS4_HELP_AGENT;
+        return tool == DS4_HELP_DS4 || tool == DS4_HELP_SERVER || tool == DS4_HELP_AGENT ||
+               tool == DS4_HELP_AGENT_SERVER;
     switch (tool) {
     case DS4_HELP_DS4:
         return streq(topic, "diagnostics") || streq(topic, "commands");
@@ -438,6 +456,8 @@ static bool tool_has_topic(ds4_help_tool tool, const char *topic) {
         return streq(topic, "benchmark");
     case DS4_HELP_EVAL:
         return streq(topic, "evaluation");
+    case DS4_HELP_AGENT_SERVER:
+        return false; /* only the universal runtime/steering/distributed topics */
     }
     return false;
 }
@@ -493,6 +513,9 @@ static void print_examples(FILE *fp, const help_colors *c, ds4_help_tool tool, c
         } else if (tool == DS4_HELP_AGENT) {
             opt(fp, c, "agent", "./ds4-agent -m ds4flash.gguf --ctx 100000");
             opt(fp, c, "quiet agent", "./ds4-agent --power 50");
+        } else if (tool == DS4_HELP_AGENT_SERVER) {
+            opt(fp, c, "server", "./ds4-agent-server -m ds4flash.gguf --ctx 100000");
+            opt(fp, c, "tunnel", "ssh -N -L 7878:127.0.0.1:7878 host   # then ./ds4-agent-client");
         } else if (tool == DS4_HELP_BENCH) {
             opt(fp, c, "bench", "./ds4-bench --prompt-file long.txt --ctx-max 32768");
             opt(fp, c, "quiet bench", "./ds4-bench --prompt-file long.txt --power 70");
@@ -511,6 +534,9 @@ static void print_examples(FILE *fp, const help_colors *c, ds4_help_tool tool, c
     } else if (tool == DS4_HELP_AGENT || topic_is(topic, "sessions") || topic_is(topic, "tools")) {
         opt(fp, c, "interactive", "./ds4-agent");
         opt(fp, c, "one shot", "./ds4-agent --non-interactive -p \"Create /tmp/hello.c\"");
+    } else if (tool == DS4_HELP_AGENT_SERVER) {
+        opt(fp, c, "server", "./ds4-agent-server -m ds4flash.gguf --ctx 100000");
+        opt(fp, c, "client", "./ds4-agent-client --server 127.0.0.1:7878");
     } else if (tool == DS4_HELP_BENCH || topic_is(topic, "benchmark")) {
         opt(fp, c, "csv", "./ds4-bench --prompt-file long.txt --ctx-max 32768 --csv speed.csv");
         opt(fp, c, "prefill only", "./ds4-bench --prompt-file long.txt --gen-tokens 0");
@@ -541,6 +567,8 @@ static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, cons
         } else if (tool == DS4_HELP_AGENT) {
             print_agent_specific(fp, c);
             print_agent_sessions(fp, c);
+        } else if (tool == DS4_HELP_AGENT_SERVER) {
+            print_agent_server_specific(fp, c);
         } else if (tool == DS4_HELP_BENCH) {
             print_bench_specific(fp, c);
         } else if (tool == DS4_HELP_EVAL) {
@@ -582,6 +610,8 @@ static void print_default(FILE *fp, const help_colors *c, ds4_help_tool tool) {
     } else if (tool == DS4_HELP_AGENT) {
         print_agent_specific(fp, c);
         print_agent_sessions(fp, c);
+    } else if (tool == DS4_HELP_AGENT_SERVER) {
+        print_agent_server_specific(fp, c);
     } else if (tool == DS4_HELP_BENCH) {
         print_bench_specific(fp, c);
     } else if (tool == DS4_HELP_EVAL) {
