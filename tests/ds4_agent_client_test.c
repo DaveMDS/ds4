@@ -785,6 +785,288 @@ static void test_prompt_queue_take_all(void) {
     free(joined);
 }
 
+/* ---- T11b: wire runtime -- push dispatcher + blocking RPC -------------- */
+
+static ap_status mk_status(uint32_t state, uint32_t ctx_used, uint32_t ctx_size) {
+    ap_status s = {0};
+    s.state = state;
+    s.ctx_used = ctx_used;
+    s.ctx_size = ctx_size;
+    return s;
+}
+
+/* Bring up a client_runtime over a fresh socketpair, with the render sink
+ * overridden to the capture buffer (client_runtime_init points it at
+ * client_editor_sink, which is only interesting once T11c has a live
+ * editor). Caller must close sv[1] and free everything else. */
+static void rt_setup(client_runtime *rt, client_conn *co, agent_worker *w,
+                     agent_token_renderer *r, int sv[2]) {
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    conn_init(co, sv[0], NULL);
+    client_worker_init(w, 100000);
+    memset(r, 0, sizeof(*r));
+    r->last_output_newline = true;
+    client_runtime_init(rt, co, w, r, 100000);
+    g_cap_len = 0;
+    g_cap[0] = '\0';
+    g_render_sink = cap_sink;
+}
+
+static void rt_teardown(client_runtime *rt, client_conn *co, agent_worker *w,
+                        int sv[2]) {
+    client_runtime_free(rt);
+    conn_free(co); /* closes sv[0] */
+    close(sv[1]);
+    client_worker_free(w);
+}
+
+static void test_dispatch_push_stream_reaches_renderer(void) {
+    client_runtime rt;
+    client_conn co;
+    agent_worker w;
+    agent_token_renderer r;
+    int sv[2];
+    rt_setup(&rt, &co, &w, &r, sv);
+
+    ap_stream s = { .kind = AGENT_STREAM_NORMAL, .text = "hello from stream",
+                    .text_len = strlen("hello from stream") };
+    ap_buf body;
+    ap_buf_init(&body);
+    ap_encode_stream(&body, &s);
+    client_dispatch_push(&rt, AGENT_MSG_STREAM, &body);
+    ap_buf_free(&body);
+
+    CHECK(strstr(g_cap, "hello from stream") != NULL);
+
+    rt_teardown(&rt, &co, &w, sv);
+}
+
+static void test_dispatch_push_status_finishes_stream_on_terminal(void) {
+    client_runtime rt;
+    client_conn co;
+    agent_worker w;
+    agent_token_renderer r;
+    int sv[2];
+    rt_setup(&rt, &co, &w, &r, sv);
+
+    /* a busy status just records the mirror; nothing to finish yet */
+    {
+        ap_status st = mk_status(AGENT_STATE_GENERATING, 10, 100000);
+        ap_buf body;
+        ap_buf_init(&body);
+        ap_encode_status(&body, &st);
+        client_dispatch_push(&rt, AGENT_MSG_STATUS, &body);
+        ap_buf_free(&body);
+    }
+    CHECK(rt.have_status);
+    CHECK(rt.last_status.state == AGENT_STATE_GENERATING);
+
+    /* a tool-name fragment opens the tool visualizer */
+    {
+        ap_stream s = { .kind = AGENT_STREAM_TOOL_NAME, .text = "read", .text_len = 4 };
+        ap_buf body;
+        ap_buf_init(&body);
+        ap_encode_stream(&body, &s);
+        client_dispatch_push(&rt, AGENT_MSG_STREAM, &body);
+        ap_buf_free(&body);
+    }
+    CHECK(rt.stream.viz.active);
+
+    /* the busy -> terminal transition closes the open visualizer */
+    {
+        ap_status st = mk_status(AGENT_STATE_IDLE, 10, 100000);
+        ap_buf body;
+        ap_buf_init(&body);
+        ap_encode_status(&body, &st);
+        client_dispatch_push(&rt, AGENT_MSG_STATUS, &body);
+        ap_buf_free(&body);
+    }
+    CHECK(!rt.stream.viz.active);
+
+    rt_teardown(&rt, &co, &w, sv);
+}
+
+static void test_dispatch_push_tool_calls_replies_over_wire(void) {
+    client_runtime rt;
+    client_conn co;
+    agent_worker w;
+    agent_token_renderer r;
+    int sv[2];
+    rt_setup(&rt, &co, &w, &r, sv);
+
+    char *dir = test_tmpdir();
+    char path[600];
+    snprintf(path, sizeof(path), "%s/w.txt", dir);
+    write_file(path, "hi there\n");
+
+    ap_tool_calls calls = {0};
+    calls.request_id = 7;
+    calls.calls[0] = mk_call("read", 1, "path", path);
+    calls.call_count = 1;
+    ap_buf body;
+    ap_buf_init(&body);
+    ap_encode_tool_calls(&body, &calls);
+    client_dispatch_push(&rt, AGENT_MSG_TOOL_CALLS, &body);
+    ap_buf_free(&body);
+
+    ap_buf rx;
+    ap_buf_init(&rx);
+    mock_drain(sv[1], &rx);
+    uint32_t type = 0;
+    ap_buf payload;
+    ap_buf_init(&payload);
+    char ferr[128] = {0};
+    CHECK(ap_read_frame(&rx, &type, &payload, ferr, sizeof(ferr)) == AP_FRAME_OK);
+    CHECK(type == AGENT_MSG_TOOL_RESULT);
+    ap_reader rd;
+    ap_reader_init(&rd, payload.data, payload.len);
+    ap_tool_result tr;
+    CHECK(ap_decode_tool_result(&rd, &tr));
+    CHECK(tr.request_id == 7);
+    CHECK(tr.text_part_count >= 1);
+    CHECK(memmem(tr.text_parts[0].ptr, tr.text_parts[0].len, "hi there", 8) != NULL);
+
+    ap_buf_free(&payload);
+    ap_buf_free(&rx);
+    rt_teardown(&rt, &co, &w, sv);
+    free(dir);
+}
+
+static void test_dispatch_push_drain_request_with_no_queue(void) {
+    client_runtime rt;
+    client_conn co;
+    agent_worker w;
+    agent_token_renderer r;
+    int sv[2];
+    rt_setup(&rt, &co, &w, &r, sv);
+    CHECK(rt.queue == NULL); /* T11c wires a real queue; empty until then */
+
+    ap_buf empty;
+    ap_buf_init(&empty);
+    client_dispatch_push(&rt, AGENT_MSG_DRAIN_REQUEST, &empty);
+    ap_buf_free(&empty);
+
+    ap_buf rx;
+    ap_buf_init(&rx);
+    mock_drain(sv[1], &rx);
+    uint32_t type = 0;
+    ap_buf payload;
+    ap_buf_init(&payload);
+    char ferr[128] = {0};
+    CHECK(ap_read_frame(&rx, &type, &payload, ferr, sizeof(ferr)) == AP_FRAME_OK);
+    CHECK(type == AGENT_MSG_DRAIN_REPLY);
+
+    ap_buf_free(&payload);
+    ap_buf_free(&rx);
+    rt_teardown(&rt, &co, &w, sv);
+}
+
+static void test_rpc_dispatches_pushes_before_reply(void) {
+    client_runtime rt;
+    client_conn co;
+    agent_worker w;
+    agent_token_renderer r;
+    int sv[2];
+    rt_setup(&rt, &co, &w, &r, sv);
+
+    /* the mock server has a STREAM + STATUS tail to deliver before it gets
+     * around to answering the SESSION request client_rpc is waiting on */
+    {
+        ap_stream s = { .kind = AGENT_STREAM_NORMAL, .text = "late tail output",
+                        .text_len = strlen("late tail output") };
+        ap_buf b;
+        ap_buf_init(&b);
+        ap_encode_stream(&b, &s);
+        mock_send(sv[1], AGENT_MSG_STREAM, &b);
+        ap_buf_free(&b);
+    }
+    {
+        ap_status st = mk_status(AGENT_STATE_IDLE, 5, 100000);
+        ap_buf b;
+        ap_buf_init(&b);
+        ap_encode_status(&b, &st);
+        mock_send(sv[1], AGENT_MSG_STATUS, &b);
+        ap_buf_free(&b);
+    }
+    {
+        ap_buf b;
+        ap_buf_init(&b);
+        ap_put_reply_ok(&b);
+        mock_send(sv[1], AGENT_MSG_SESSION, &b);
+        ap_buf_free(&b);
+    }
+
+    ap_buf send_body;
+    ap_buf_init(&send_body);
+    ap_encode_session_simple(&send_body, AGENT_SESSION_SAVE);
+    char err[256] = {0};
+    ap_buf reply;
+    CHECK(client_rpc(&rt, AGENT_MSG_SESSION, &send_body, AGENT_MSG_SESSION,
+                     &reply, err, sizeof(err)));
+    CHECK(err[0] == '\0');
+    ap_buf_free(&send_body);
+    ap_buf_free(&reply);
+
+    /* the pushed frames were dispatched on the way to the reply */
+    CHECK(strstr(g_cap, "late tail output") != NULL);
+    CHECK(rt.have_status);
+    CHECK(rt.last_status.state == AGENT_STATE_IDLE);
+
+    rt_teardown(&rt, &co, &w, sv);
+}
+
+static void test_refresh_session_list(void) {
+    client_runtime rt;
+    client_conn co;
+    agent_worker w;
+    agent_token_renderer r;
+    int sv[2];
+    rt_setup(&rt, &co, &w, &r, sv);
+
+    {
+        ap_buf b;
+        ap_buf_init(&b);
+        ap_put_reply_arr_begin(&b, 2);
+        {
+            ap_map_writer mw;
+            ap_map_begin(&mw, &b);
+            ap_map_put_cstr(&mw, "sha", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+            ap_map_put_cstr(&mw, "title", "first session");
+            ap_map_put_u32(&mw, "tokens", 123);
+            ap_map_put_i64(&mw, "created_at", 1000);
+            ap_map_put_i64(&mw, "last_used", 2000);
+            ap_map_put_bool(&mw, "is_current", true);
+            ap_map_end(&mw);
+        }
+        {
+            ap_map_writer mw;
+            ap_map_begin(&mw, &b);
+            ap_map_put_cstr(&mw, "sha", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+            ap_map_put_cstr(&mw, "title", "second session");
+            ap_map_put_u32(&mw, "tokens", 456);
+            ap_map_put_i64(&mw, "created_at", 500);
+            ap_map_put_i64(&mw, "last_used", 900);
+            ap_map_put_bool(&mw, "is_current", false);
+            ap_map_end(&mw);
+        }
+        mock_send(sv[1], AGENT_MSG_SESSION, &b);
+        ap_buf_free(&b);
+    }
+
+    char err[256] = {0};
+    CHECK(client_refresh_session_list(&rt, err, sizeof(err)));
+    CHECK(err[0] == '\0');
+    CHECK(rt.sessions.len == 2);
+    CHECK(strcmp(rt.sessions.v[0].sha, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == 0);
+    CHECK(strcmp(rt.sessions.v[0].title, "first session") == 0);
+    CHECK(rt.sessions.v[0].tokens == 123);
+    CHECK(rt.sessions.v[0].is_current == true);
+    CHECK(strcmp(rt.sessions.v[1].sha, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb") == 0);
+    CHECK(rt.sessions.v[1].is_current == false);
+
+    rt_teardown(&rt, &co, &w, sv);
+}
+
 int main(void) {
     test_handshake_new_session();
     test_handshake_resume();
@@ -807,6 +1089,12 @@ int main(void) {
     test_welcome_banner();
     test_footer_with_queue();
     test_prompt_queue_take_all();
+    test_dispatch_push_stream_reaches_renderer();
+    test_dispatch_push_status_finishes_stream_on_terminal();
+    test_dispatch_push_tool_calls_replies_over_wire();
+    test_dispatch_push_drain_request_with_no_queue();
+    test_rpc_dispatches_pushes_before_reply();
+    test_refresh_session_list();
 
     if (failures) {
         fprintf(stderr, "%d agent client test(s) failed\n", failures);

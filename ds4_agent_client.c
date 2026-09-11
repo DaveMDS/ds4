@@ -5951,6 +5951,267 @@ static int agent_read_stdin_available(agent_input_buf *in, bool *eof) {
 
 
 /* ========================================================================= */
+/* T11b: wire runtime -- generic reply decode, the session-list cache, the    */
+/* push-frame dispatcher (STREAM/STATUS/TOOL_CALLS/DRAIN_REQUEST) and a       */
+/* blocking request/reply helper that keeps dispatching pushes while it       */
+/* waits. The interactive loop and main() are T11c.                          */
+/* ========================================================================= */
+
+static void client_editor_sink(const char *s, size_t n);
+
+/* -- generic SESSION/CONFIG reply decode ---------------------------- */
+
+static bool client_decode_reply_map(ap_reader *r, ap_map *out,
+                                    char *err, size_t errlen) {
+    uint32_t tag = 0;
+    if (!ap_get_reply_tag(r, &tag)) {
+        snprintf(err, errlen, "malformed reply");
+        return false;
+    }
+    if (tag == AP_REPLY_ERR) {
+        char m[AP_CAP_ERROR] = {0};
+        ap_get_reply_err(r, m, sizeof(m));
+        snprintf(err, errlen, "%s", m[0] ? m : "server error");
+        return false;
+    }
+    if (tag != AP_REPLY_MAP) {
+        snprintf(err, errlen, "unexpected reply shape");
+        return false;
+    }
+    if (!ap_get_map(r, out)) {
+        snprintf(err, errlen, "malformed reply body");
+        return false;
+    }
+    return true;
+}
+
+static bool client_decode_reply_arr_begin(ap_reader *r, uint32_t *row_count,
+                                          char *err, size_t errlen) {
+    uint32_t tag = 0;
+    if (!ap_get_reply_tag(r, &tag)) {
+        snprintf(err, errlen, "malformed reply");
+        return false;
+    }
+    if (tag == AP_REPLY_ERR) {
+        char m[AP_CAP_ERROR] = {0};
+        ap_get_reply_err(r, m, sizeof(m));
+        snprintf(err, errlen, "%s", m[0] ? m : "server error");
+        return false;
+    }
+    if (tag != AP_REPLY_ARR) {
+        snprintf(err, errlen, "unexpected reply shape");
+        return false;
+    }
+    if (!ap_get_arr(r, row_count)) {
+        snprintf(err, errlen, "malformed reply body");
+        return false;
+    }
+    return true;
+}
+
+/* -- session-list cache (Risk 15: /switch tab completion) ----------- */
+
+typedef struct {
+    char sha[AP_CAP_SHA];
+    char title[AP_CAP_TITLE];
+    uint32_t tokens;
+    long long created_at;
+    long long last_used;
+    bool is_current;
+} client_session_row;
+
+typedef struct {
+    client_session_row *v;
+    size_t len;
+    size_t cap;
+} client_session_list;
+
+static void client_session_list_free(client_session_list *l) {
+    free(l->v);
+    memset(l, 0, sizeof(*l));
+}
+
+static void client_session_list_push(client_session_list *l, client_session_row row) {
+    if (l->len == l->cap) {
+        l->cap = l->cap ? l->cap * 2 : 8;
+        l->v = xrealloc(l->v, l->cap * sizeof(l->v[0]));
+    }
+    l->v[l->len++] = row;
+}
+
+/* -- runtime: everything the push dispatcher needs ------------------ */
+
+typedef struct {
+    client_conn *co;
+    agent_worker *worker;
+    agent_stream_renderer stream;
+    agent_editor *editor;        /* NULL until the editor starts (T11c) */
+    agent_prompt_queue *queue;   /* NULL until the loop owns one (T11c) */
+    ap_status last_status;
+    bool have_status;
+    client_session_list sessions;
+} client_runtime;
+
+static void client_runtime_init(client_runtime *rt, client_conn *co,
+                                agent_worker *worker, agent_token_renderer *rndr,
+                                int ctx_size) {
+    memset(rt, 0, sizeof(*rt));
+    rt->co = co;
+    rt->worker = worker;
+    client_stream_renderer_init(&rt->stream, rndr, ctx_size);
+    g_render_sink = client_editor_sink; /* falls back to plain stdout until
+                                         * the editor starts (T11c) */
+}
+
+static void client_runtime_free(client_runtime *rt) {
+    client_session_list_free(&rt->sessions);
+}
+
+/* Recompute and push the footer whenever the editor is live. */
+static void client_runtime_refresh_footer(client_runtime *rt) {
+    if (!rt->editor || !rt->editor->active || !rt->have_status) return;
+    agent_status st;
+    client_status_from_wire(&rt->last_status, &st);
+    int cols = rt->editor->term_cols > 0 ? rt->editor->term_cols : 80;
+    char buf[1024];
+    build_footer_text(&st, rt->queue, cols, buf, sizeof(buf));
+    editor_update_status(rt->editor, buf);
+    editor_flush_prompt_status(rt->editor, false);
+}
+
+/* Handle one server-pushed frame: STREAM, STATUS, TOOL_CALLS, DRAIN_REQUEST.
+ * Anything else (a SESSION/CONFIG reply) is the concern of whoever is waiting
+ * for it in client_rpc. */
+static void client_dispatch_push(client_runtime *rt, uint32_t type,
+                                 const ap_buf *payload) {
+    ap_reader r;
+    ap_reader_init(&r, payload->data, payload->len);
+    switch (type) {
+    case AGENT_MSG_STREAM: {
+        ap_stream s;
+        if (!ap_decode_stream(&r, &s)) return;
+        client_apply_stream_fragment(&rt->stream, s.kind, s.text, s.text_len);
+        break;
+    }
+    case AGENT_MSG_STATUS: {
+        ap_status w;
+        if (!ap_decode_status(&r, &w)) return;
+        bool was_busy = rt->have_status &&
+            (rt->last_status.state == AGENT_STATE_PREFILL ||
+             rt->last_status.state == AGENT_STATE_GENERATING ||
+             rt->last_status.state == AGENT_STATE_COMPACTING);
+        bool now_terminal = w.state == AGENT_STATE_IDLE ||
+            w.state == AGENT_STATE_ERROR || w.state == AGENT_STATE_STOPPED;
+        rt->last_status = w;
+        rt->have_status = true;
+        if (was_busy && now_terminal) client_stream_renderer_finish(&rt->stream);
+        client_runtime_refresh_footer(rt);
+        break;
+    }
+    case AGENT_MSG_TOOL_CALLS: {
+        ap_tool_calls calls;
+        if (!ap_decode_tool_calls(&r, &calls)) return;
+        client_handle_tool_calls(rt->co, rt->worker, &calls);
+        break;
+    }
+    case AGENT_MSG_DRAIN_REQUEST: {
+        char *queued = rt->queue ? agent_prompt_queue_take_all(rt->queue) : NULL;
+        client_handle_drain_request(rt->co, rt->worker, queued);
+        free(queued);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+/* Send one request and block until its reply arrives, dispatching any
+ * server-pushed frames (STREAM/STATUS/TOOL_CALLS/DRAIN_REQUEST) that show up
+ * first -- the server can still be finishing a prior turn's tail. On success
+ * *reply_out (if given) owns the reply payload; the caller frees it. */
+static bool client_rpc(client_runtime *rt, uint32_t send_type,
+                       const ap_buf *send_body, uint32_t want_reply_type,
+                       ap_buf *reply_out, char *err, size_t errlen) {
+    if (!conn_send(rt->co, send_type, send_body)) {
+        snprintf(err, errlen, "failed to send %s", ap_msg_name(send_type));
+        return false;
+    }
+    for (;;) {
+        uint32_t type = 0;
+        ap_buf payload;
+        ap_buf_init(&payload);
+        conn_frame_result fr = conn_recv(rt->co, &type, &payload, err, errlen);
+        if (fr == CONN_FRAME_CLOSED) {
+            snprintf(err, errlen, "server closed the connection");
+            ap_buf_free(&payload);
+            return false;
+        }
+        if (fr == CONN_FRAME_ERROR) {
+            ap_buf_free(&payload);
+            return false;
+        }
+        if (type == want_reply_type) {
+            if (reply_out) *reply_out = payload;
+            else ap_buf_free(&payload);
+            return true;
+        }
+        client_dispatch_push(rt, type, &payload);
+        ap_buf_free(&payload);
+    }
+}
+
+/* Refresh the session-list cache from SESSION list. Called at startup (right
+ * after the SESSION new/resume reply) and after every store-mutating reply:
+ * SESSION save/del/switch/new and an explicit /list (Risk 15). */
+static bool client_refresh_session_list(client_runtime *rt, char *err, size_t errlen) {
+    ap_buf body;
+    ap_buf_init(&body);
+    ap_encode_session_simple(&body, AGENT_SESSION_LIST);
+    ap_buf reply;
+    bool ok = client_rpc(rt, AGENT_MSG_SESSION, &body, AGENT_MSG_SESSION,
+                         &reply, err, errlen);
+    ap_buf_free(&body);
+    if (!ok) return false;
+
+    ap_reader r;
+    ap_reader_init(&r, reply.data, reply.len);
+    uint32_t rows = 0;
+    if (!client_decode_reply_arr_begin(&r, &rows, err, errlen)) {
+        ap_buf_free(&reply);
+        return false;
+    }
+    client_session_list_free(&rt->sessions);
+    for (uint32_t i = 0; i < rows; i++) {
+        ap_map mp;
+        if (!ap_get_map(&r, &mp)) break;
+        client_session_row row = {0};
+        ap_map_get_str(&mp, "sha", row.sha, sizeof(row.sha));
+        ap_map_get_str(&mp, "title", row.title, sizeof(row.title));
+        row.tokens = ap_map_get_u32(&mp, "tokens", 0);
+        row.created_at = ap_map_get_i64(&mp, "created_at", 0);
+        row.last_used = ap_map_get_i64(&mp, "last_used", 0);
+        row.is_current = ap_map_get_bool(&mp, "is_current", false);
+        client_session_list_push(&rt->sessions, row);
+    }
+    ap_buf_free(&reply);
+    return true;
+}
+
+/* -- render sink: route painted bytes through the live editor ------- */
+
+static agent_editor *g_active_editor;
+
+static void client_editor_sink(const char *s, size_t n) {
+    if (g_active_editor && g_active_editor->active) {
+        editor_write_async(g_active_editor, s, n, g_active_editor->prompt,
+                           g_active_editor->status, false);
+    } else {
+        write_all(STDOUT_FILENO, s, n);
+    }
+}
+
+
+/* ========================================================================= */
 /* main                                                                       */
 /* ========================================================================= */
 
