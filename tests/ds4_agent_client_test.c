@@ -1437,6 +1437,138 @@ static void test_save_prompt_helpers_skip_when_clean(void) {
     rt_teardown(&rt, &co, &w, sv);
 }
 
+/* ---- T11c-b: run_client_non_interactive end-to-end ---------------------
+ * The one-shot path (-p/--prompt) never touches STDIN_FILENO, so it is the
+ * only loop entry point this test suite can drive without a pty. Redirects
+ * the real stdout to a pipe for the duration of the call to capture what
+ * the render sink wrote (no live editor is active in headless mode, so
+ * client_editor_sink falls back to a plain stdout write). */
+static void test_non_interactive_one_shot_e2e(void) {
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+
+    int outpipe[2];
+    CHECK(pipe(outpipe) == 0);
+    int saved_stdout = dup(STDOUT_FILENO);
+    CHECK(saved_stdout >= 0);
+    CHECK(dup2(outpipe[1], STDOUT_FILENO) >= 0);
+    close(outpipe[1]);
+
+    /* Full turn scripted up front: STATUS{PREFILL} -> STREAM -> TOOL_CALLS
+     * -> (the loop executes it and replies TOOL_RESULT) -> STREAM ->
+     * terminal STATUS{IDLE}. */
+    {
+        ap_status st = mk_status(AGENT_STATE_PREFILL, 0, 100000);
+        ap_buf b;
+        ap_buf_init(&b);
+        ap_encode_status(&b, &st);
+        mock_send(sv[1], AGENT_MSG_STATUS, &b);
+        ap_buf_free(&b);
+    }
+    {
+        ap_stream s = { .kind = AGENT_STREAM_NORMAL, .text = "Sure, reading now.\n",
+                        .text_len = strlen("Sure, reading now.\n") };
+        ap_buf b;
+        ap_buf_init(&b);
+        ap_encode_stream(&b, &s);
+        mock_send(sv[1], AGENT_MSG_STREAM, &b);
+        ap_buf_free(&b);
+    }
+    char *dir = test_tmpdir();
+    char path[600];
+    snprintf(path, sizeof(path), "%s/w.txt", dir);
+    write_file(path, "file body\n");
+    {
+        ap_tool_calls calls = {0};
+        calls.request_id = 1;
+        calls.calls[0] = mk_call("read", 1, "path", path);
+        calls.call_count = 1;
+        ap_buf b;
+        ap_buf_init(&b);
+        ap_encode_tool_calls(&b, &calls);
+        mock_send(sv[1], AGENT_MSG_TOOL_CALLS, &b);
+        ap_buf_free(&b);
+    }
+    {
+        ap_stream s = { .kind = AGENT_STREAM_NORMAL, .text = "Done.\n",
+                        .text_len = strlen("Done.\n") };
+        ap_buf b;
+        ap_buf_init(&b);
+        ap_encode_stream(&b, &s);
+        mock_send(sv[1], AGENT_MSG_STREAM, &b);
+        ap_buf_free(&b);
+    }
+    {
+        ap_status st = mk_status(AGENT_STATE_IDLE, 20, 100000);
+        ap_buf b;
+        ap_buf_init(&b);
+        ap_encode_status(&b, &st);
+        mock_send(sv[1], AGENT_MSG_STATUS, &b);
+        ap_buf_free(&b);
+    }
+
+    client_conn co;
+    conn_init(&co, sv[0], NULL);
+    client_config cfg = {0};
+    snprintf(cfg.server_host, sizeof(cfg.server_host), "127.0.0.1");
+    cfg.prompt = "please read the file";
+
+    client_session sess;
+    memset(&sess, 0, sizeof(sess));
+    sess.ready = make_ready();
+
+    int rc = run_client_non_interactive(&co, &cfg, &sess);
+
+    fflush(stdout);
+    dup2(saved_stdout, STDOUT_FILENO);
+    close(saved_stdout);
+
+    char cap[4096] = {0};
+    ssize_t n = read(outpipe[0], cap, sizeof(cap) - 1);
+    close(outpipe[0]);
+    if (n > 0) cap[n] = '\0';
+
+    CHECK(rc == 0);
+    CHECK(strstr(cap, "Sure, reading now.") != NULL);
+    CHECK(strstr(cap, "Done.") != NULL);
+
+    /* client sends, in order: TURN then TOOL_RESULT, nothing else. */
+    ap_buf rx;
+    ap_buf_init(&rx);
+    mock_drain(sv[1], &rx);
+    uint32_t type = 0;
+    ap_buf payload;
+    ap_buf_init(&payload);
+    char ferr[128] = {0};
+    CHECK(ap_read_frame(&rx, &type, &payload, ferr, sizeof(ferr)) == AP_FRAME_OK);
+    CHECK(type == AGENT_MSG_TURN);
+    {
+        ap_reader r;
+        ap_reader_init(&r, payload.data, payload.len);
+        ap_turn t;
+        CHECK(ap_decode_turn(&r, &t));
+        CHECK(t.text_len == strlen("please read the file"));
+    }
+    CHECK(ap_read_frame(&rx, &type, &payload, ferr, sizeof(ferr)) == AP_FRAME_OK);
+    CHECK(type == AGENT_MSG_TOOL_RESULT);
+    {
+        ap_reader r;
+        ap_reader_init(&r, payload.data, payload.len);
+        ap_tool_result tr;
+        CHECK(ap_decode_tool_result(&r, &tr));
+        CHECK(tr.request_id == 1);
+        CHECK(tr.text_part_count >= 1);
+        CHECK(memmem(tr.text_parts[0].ptr, tr.text_parts[0].len, "file body", 9) != NULL);
+    }
+    CHECK(ap_read_frame(&rx, &type, &payload, ferr, sizeof(ferr)) != AP_FRAME_OK);
+
+    ap_buf_free(&payload);
+    ap_buf_free(&rx);
+    conn_free(&co);
+    close(sv[1]);
+    free(dir);
+}
+
 int main(void) {
     test_handshake_new_session();
     test_handshake_resume();
@@ -1477,6 +1609,7 @@ int main(void) {
     test_session_new_mid_session();
     test_switch_completion_from_cache();
     test_save_prompt_helpers_skip_when_clean();
+    test_non_interactive_one_shot_e2e();
 
     if (failures) {
         fprintf(stderr, "%d agent client test(s) failed\n", failures);

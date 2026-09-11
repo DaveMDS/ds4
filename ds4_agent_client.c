@@ -2600,8 +2600,17 @@ static int agent_web_confirm(void *privdata, const char *message,
     snprintf(prompt, sizeof(prompt), "%s ",
              message ? message : "Start visible Chrome browser? (y/n)");
     g_render_sink(prompt, strlen(prompt));
+    /* stdin may be in non-blocking raw mode (the interactive editor sets
+     * this); switch to blocking so fgets can wait for the answer, same
+     * trick as agent_prompt_yes_no_ex. */
+    int saved_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    if (saved_flags >= 0 && (saved_flags & O_NONBLOCK))
+        fcntl(STDIN_FILENO, F_SETFL, saved_flags & ~O_NONBLOCK);
     char line[16] = {0};
-    if (!fgets(line, sizeof(line), stdin)) {
+    bool got_line = fgets(line, sizeof(line), stdin) != NULL;
+    if (saved_flags >= 0 && (saved_flags & O_NONBLOCK))
+        fcntl(STDIN_FILENO, F_SETFL, saved_flags);
+    if (!got_line) {
         snprintf(err, err_len, "no answer");
         return 0;
     }
@@ -4579,6 +4588,12 @@ static void client_tool_call_free_wire(agent_tool_call *c) {
  * Mirrors ds4_agent.c's agent_execute_tool_observation. */
 static void client_execute_tool_calls(agent_worker *w, const ap_tool_calls *calls,
                                       client_tool_result *out) {
+    /* A Ctrl+C from a previous, already-finished batch must not leak into
+     * this one -- worker_should_interrupt (checked by agent_web_cancel and
+     * the bash wait loop) is a fresh per-batch flag. */
+    pthread_mutex_lock(&w->mu);
+    w->interrupt_requested = false;
+    pthread_mutex_unlock(&w->mu);
     client_tool_result_init(out);
     for (uint32_t i = 0; i < calls->call_count; i++) {
         char namebuf[128];
@@ -6129,9 +6144,21 @@ static void client_dispatch_push(client_runtime *rt, uint32_t type,
         break;
     }
     case AGENT_MSG_DRAIN_REQUEST: {
+        /* Echo queued prompts into the live scroll-back before they vanish
+         * into the drained text (mirrors ds4_agent.c's take_all_echo, which
+         * peeks without mutating the queue -- only meaningful with a live
+         * editor; non-interactive mode has nothing to echo into). */
+        bool have_editor = rt->editor && rt->editor->active;
+        char *echo = have_editor && rt->queue ?
+            agent_prompt_queue_take_all_echo(rt->queue) : NULL;
+        if (echo) {
+            g_render_sink(echo, strlen(echo));
+            free(echo);
+        }
         char *queued = rt->queue ? agent_prompt_queue_take_all(rt->queue) : NULL;
         client_handle_drain_request(rt->co, rt->worker, queued);
         free(queued);
+        if (have_editor) client_runtime_refresh_footer(rt);
         break;
     }
     default:
@@ -6679,6 +6706,671 @@ static void client_print_session_list(client_runtime *rt) {
 /* main                                                                       */
 /* ========================================================================= */
 
+/* ========================================================================= */
+/* T11c-b: the interactive/non-interactive loop and main() -- ds4_agent.c's   */
+/* run_agent / run_agent_non_interactive reworked onto the protocol. Every    */
+/* piece this drives (command RPCs, push dispatch, tool execution, the       */
+/* render/editor stack) was already built and tested in T8-T11c-a; this task */
+/* is orchestration.                                                        */
+/* ========================================================================= */
+
+/* Mirrors ds4_agent.c's worker_check_raw_mode_restore: a background bash job
+ * may have left the terminal in cooked mode (e.g. an interactive child that
+ * changed it); the editor needs to know to put raw mode back. */
+static bool client_worker_check_raw_mode_restore(agent_worker *w) {
+    bool needs = false;
+    pthread_mutex_lock(&w->mu);
+    if (w->raw_mode_needs_restore) {
+        w->raw_mode_needs_restore = false;
+        needs = true;
+    }
+    pthread_mutex_unlock(&w->mu);
+    return needs;
+}
+
+/* Non-blocking top-up of co->rx from the socket, for a poll()-driven loop.
+ * Returns 1 if the read would now block (co->rx holds everything currently
+ * available, including possibly nothing new), -1 on a hard error (err set),
+ * -2 if the peer closed the connection. */
+static int client_conn_fill_nonblock(client_conn *co, char *err, size_t errlen) {
+    for (;;) {
+        char buf[16384];
+        ssize_t n = recv(co->fd, buf, sizeof(buf), MSG_DONTWAIT);
+        if (n > 0) {
+            if (!ap_buf_append(&co->rx, buf, (size_t)n)) {
+                snprintf(err, errlen, "receive buffer allocation failed");
+                return -1;
+            }
+            if ((size_t)n < sizeof(buf)) return 1;
+            continue; /* the socket may still have more buffered */
+        }
+        if (n == 0) return -2;
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
+        snprintf(err, errlen, "recv: %s", strerror(errno));
+        return -1;
+    }
+}
+
+/* Dispatch every frame already fully buffered in rt->co->rx -- no syscall,
+ * so this never blocks. Call after client_conn_fill_nonblock so a socket
+ * read that pulled more than one frame's worth of bytes does not leave a
+ * frame stranded until the next unrelated write from the server (poll() is
+ * level-triggered on the *socket*, not on rt->co->rx). */
+static bool client_drain_pushes(client_runtime *rt, char *err, size_t errlen) {
+    for (;;) {
+        uint32_t type = 0;
+        ap_buf payload;
+        ap_buf_init(&payload);
+        ap_frame_status fs = ap_read_frame(&rt->co->rx, &type, &payload, err, errlen);
+        if (fs == AP_FRAME_ERROR) { ap_buf_free(&payload); return false; }
+        if (fs != AP_FRAME_OK) { ap_buf_free(&payload); return true; }
+        conn_trace(rt->co, "<-", type, payload.len);
+        client_dispatch_push(rt, type, &payload);
+        ap_buf_free(&payload);
+    }
+}
+
+/* Headless mode: same small stdin protocol as ds4_agent.c's
+ * run_agent_non_interactive, driving TURN/queue over the wire instead of an
+ * in-process worker. */
+static int run_client_non_interactive(client_conn *co, const client_config *cfg,
+                                      client_session *sess) {
+    agent_worker w;
+    client_worker_init(&w, (int)sess->ready.ctx_size);
+    client_worker_init_web(&w);
+
+    agent_token_renderer rndr;
+    memset(&rndr, 0, sizeof(rndr));
+    rndr.format_thinking = true;
+    rndr.format_markdown = true;
+    rndr.use_color = isatty(STDOUT_FILENO) != 0;
+    rndr.last_output_newline = true;
+
+    client_runtime rt;
+    client_runtime_init(&rt, co, &w, &rndr, (int)sess->ready.ctx_size);
+    rt.have_status = true;
+    rt.last_status.state = sess->ready.state;
+    rt.last_status.ctx_used = sess->ready.ctx_used;
+    rt.last_status.ctx_size = sess->ready.ctx_size;
+
+    const bool one_shot = cfg->prompt != NULL;
+    bool one_shot_submitted = false;
+    bool stdin_eof = false;
+    bool waiting_announced = false;
+    bool stdin_nonblock = false;
+    int old_stdin_flags = 0;
+    agent_input_buf input = {0};
+    agent_prompt_queue queue = {0};
+    rt.queue = &queue;
+    double quiet_deadline = 0.0;
+    int rc = 0;
+
+    if (!one_shot) {
+        if (set_nonblock(STDIN_FILENO, true, &old_stdin_flags) != 0) {
+            perror("ds4-agent-client: nonblocking stdin");
+            client_runtime_free(&rt);
+            client_worker_free(&w);
+            return 1;
+        }
+        stdin_nonblock = true;
+    }
+
+    while (true) {
+        bool idle = client_worker_is_idle(&rt);
+
+        if (one_shot && !one_shot_submitted) {
+            if (client_turn_submit(&rt, cfg->prompt)) {
+                one_shot_submitted = true;
+                idle = false;
+            }
+        }
+
+        if (!one_shot && queue.len && idle) {
+            char *queued = agent_prompt_queue_take_all(&queue);
+            if (client_turn_submit(&rt, queued)) {
+                idle = false;
+            } else {
+                agent_prompt_queue_push_front(&queue, queued);
+                queued = NULL;
+            }
+            free(queued);
+        }
+
+        if (!one_shot && idle && !queue.len &&
+            input.len == 0 && !stdin_eof && !waiting_announced)
+        {
+            agent_noninteractive_marker("+DWARFSTAR_WAITING");
+            waiting_announced = true;
+        }
+
+        int timeout_ms = -1;
+        if (!one_shot && input.len > 0) {
+            double rem = quiet_deadline - now_sec();
+            timeout_ms = rem <= 0.0 ? 0 : (int)(rem * 1000.0) + 1;
+        }
+
+        struct pollfd pfd[2];
+        int nfds = 0;
+        int sock_idx = nfds;
+        pfd[nfds++] = (struct pollfd){.fd = co->fd, .events = POLLIN};
+        int stdin_idx = -1;
+        if (!one_shot && !stdin_eof) {
+            stdin_idx = nfds;
+            pfd[nfds++] = (struct pollfd){.fd = STDIN_FILENO, .events = POLLIN};
+        }
+
+        int prc = poll(pfd, (nfds_t)nfds, timeout_ms);
+        if (prc < 0) {
+            if (errno == EINTR) continue;
+            perror("ds4-agent-client: poll");
+            rc = 1;
+            break;
+        }
+
+        if (pfd[sock_idx].revents & (POLLIN | POLLHUP | POLLERR)) {
+            char werr[256] = {0};
+            int fr = client_conn_fill_nonblock(co, werr, sizeof(werr));
+            if (fr == -2) {
+                fprintf(stderr, "ds4-agent-client: server closed the connection\n");
+                rc = 1;
+                break;
+            }
+            if (fr == -1) {
+                fprintf(stderr, "ds4-agent-client: %s\n", werr);
+                rc = 1;
+                break;
+            }
+            if (!client_drain_pushes(&rt, werr, sizeof(werr))) {
+                fprintf(stderr, "ds4-agent-client: %s\n", werr);
+                rc = 1;
+                break;
+            }
+        }
+
+        if (stdin_idx >= 0 && (pfd[stdin_idx].revents & (POLLIN | POLLHUP))) {
+            size_t old_len = input.len;
+            if (agent_read_stdin_available(&input, &stdin_eof) != 0) {
+                rc = 1;
+                break;
+            }
+            if (input.len != old_len) {
+                quiet_deadline = now_sec() + 0.200;
+                waiting_announced = false;
+            }
+        }
+
+        /* client_dispatch_push already surfaced the error text through the
+         * render sink (stdout, headless); here it is only fatal-or-not. */
+        if (rt.last_status.state == AGENT_STATE_ERROR) {
+            rc = 1;
+            break;
+        }
+
+        if (!one_shot && input.len > 0 &&
+            (stdin_eof || now_sec() >= quiet_deadline))
+        {
+            char *prompt = agent_input_buf_take(&input);
+            if (client_worker_is_idle(&rt) && queue.len == 0) {
+                if (!client_turn_submit(&rt, prompt)) {
+                    agent_prompt_queue_push(&queue, prompt);
+                    agent_noninteractive_marker("+DWARFSTAR_QUEUED");
+                }
+            } else {
+                agent_prompt_queue_push(&queue, prompt);
+                agent_noninteractive_marker("+DWARFSTAR_QUEUED");
+            }
+            free(prompt);
+            waiting_announced = false;
+        }
+
+        if (one_shot && one_shot_submitted && client_worker_is_idle(&rt)) break;
+        if (!one_shot && stdin_eof && input.len == 0 &&
+            queue.len == 0 && client_worker_is_idle(&rt))
+            break;
+    }
+
+    if (stdin_nonblock) fcntl(STDIN_FILENO, F_SETFL, old_stdin_flags);
+    agent_input_buf_free(&input);
+    agent_prompt_queue_free(&queue);
+    client_runtime_free(&rt);
+    client_worker_free(&w);
+    return rc;
+}
+
+/* Interactive UI loop. poll() multiplexes stdin with the server socket
+ * (ds4_agent.c multiplexed stdin with the in-process worker's wake pipe);
+ * all terminal writes still go through editor_write_async(), reached here
+ * indirectly via g_render_sink -> client_editor_sink so streamed model
+ * output, tool output, and footer/prompt repaints never race each other. */
+static int run_client_interactive(client_conn *co, client_config *cfg,
+                                  client_session *sess) {
+    agent_worker w;
+    client_worker_init(&w, (int)sess->ready.ctx_size);
+    client_worker_init_web(&w);
+
+    agent_token_renderer rndr;
+    memset(&rndr, 0, sizeof(rndr));
+    rndr.format_thinking = true;
+    rndr.format_markdown = true;
+    rndr.use_color = isatty(STDOUT_FILENO) != 0;
+    rndr.last_output_newline = true;
+
+    client_runtime rt;
+    client_runtime_init(&rt, co, &w, &rndr, (int)sess->ready.ctx_size);
+    rt.have_status = true;
+    rt.last_status.state = sess->ready.state;
+    rt.last_status.ctx_used = sess->ready.ctx_used;
+    rt.last_status.ctx_size = sess->ready.ctx_size;
+
+    char histpath[PATH_MAX];
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) home = ".";
+    snprintf(histpath, sizeof(histpath), "%s/.ds4_agent_history", home);
+    linenoiseSetMultiLine(1);
+    linenoiseHistorySetMaxLen(512);
+    linenoiseHistoryLoad(histpath);
+    g_completion_runtime = &rt;
+    linenoiseSetCompletionCallback(client_switch_completion_callback);
+
+    /* Seed the session-list cache once up front (Risk 15); refreshed again
+     * after every store-mutating SESSION reply below. */
+    {
+        char lerr[192] = {0};
+        client_refresh_session_list(&rt, lerr, sizeof(lerr));
+    }
+
+    agent_status st;
+    client_status_from_wire(&rt.last_status, &st);
+    char prompt[160];
+    char statusline[4096];
+    build_prompt_text(&st, prompt, sizeof(prompt));
+    build_footer_text(&st, NULL, 80, statusline, sizeof(statusline));
+
+    agent_editor editor = {0};
+    agent_prompt_queue queue = {0};
+    rt.editor = &editor;
+    rt.queue = &queue;
+    if (editor_start(&editor, prompt, statusline, NULL) != 0) {
+        fprintf(stderr, "ds4-agent-client: failed to start line editor\n");
+        client_runtime_free(&rt);
+        client_worker_free(&w);
+        return 1;
+    }
+    g_active_editor = &editor;
+    editor_write_welcome_banner(&editor, (int)rt.last_status.ctx_size, prompt, statusline);
+
+    char *initial_pending = cfg->prompt && cfg->prompt[0] ?
+                            xstrdup(cfg->prompt) : NULL;
+
+    bool running = true;
+    int rc = 0;
+    bool exit_save_handled = false;
+    bool disconnected = false;
+    bool show_welcome_after_restart = false;
+    bool force_status_redraw_after_restart = false;
+    char *restore_line = NULL;
+    while (running) {
+        if (client_worker_check_raw_mode_restore(&w)) linenoiseRestoreRawMode();
+
+        struct pollfd pfd[2] = {
+            {.fd = STDIN_FILENO, .events = POLLIN},
+            {.fd = co->fd, .events = POLLIN},
+        };
+        int timeout = (!editor.paste_open && !editor.paste_start_pending &&
+                       linenoiseEditQueuedInput(&editor.edit) > 0) ? 0 : 100;
+        int prc = poll(pfd, 2, timeout);
+        if (prc < 0 && errno != EINTR) break;
+
+        if (agent_sigint) {
+            agent_sigint = 0;
+            if (client_worker_is_idle(&rt)) {
+                editor_cancel_input_with_hint(&editor, prompt, statusline);
+            } else {
+                pthread_mutex_lock(&w.mu);
+                w.interrupt_requested = true;
+                pthread_mutex_unlock(&w.mu);
+                client_worker_interrupt(&rt);
+            }
+        }
+
+        if (prc > 0 && (pfd[0].revents & POLLIN)) editor_read_stdin(&editor);
+
+        /* Handled before the socket is drained, same reasoning as
+         * ds4_agent.c: a busy stream can leave the interrupt waiting behind
+         * a large output backlog otherwise. */
+        if (editor_take_queued_byte(&editor, 3)) { /* Ctrl+C */
+            if (!client_worker_is_idle(&rt)) {
+                pthread_mutex_lock(&w.mu);
+                w.interrupt_requested = true;
+                pthread_mutex_unlock(&w.mu);
+                client_worker_interrupt(&rt);
+            } else {
+                editor_cancel_input_with_hint(&editor, prompt, statusline);
+            }
+        }
+
+        if (prc > 0 && (pfd[1].revents & (POLLIN | POLLHUP | POLLERR))) {
+            char werr[256] = {0};
+            int fr = client_conn_fill_nonblock(co, werr, sizeof(werr));
+            if (fr == -2 || fr == -1) {
+                editor_stop(&editor);
+                editor_restore_terminal_layout(&editor);
+                fprintf(stderr, "ds4-agent-client: %s\n",
+                       fr == -2 ? "server closed the connection" : werr);
+                disconnected = true;
+                exit_save_handled = true;
+                rc = 1;
+                break;
+            }
+            if (!client_drain_pushes(&rt, werr, sizeof(werr))) {
+                editor_stop(&editor);
+                editor_restore_terminal_layout(&editor);
+                fprintf(stderr, "ds4-agent-client: %s\n", werr);
+                disconnected = true;
+                exit_save_handled = true;
+                rc = 1;
+                break;
+            }
+        }
+        /* client_dispatch_push already refreshed the footer on any STATUS it
+         * saw and surfaced AGENT_STATE_ERROR through the render sink -- the
+         * loop only needs prompt/footer text for its own editor_start calls
+         * below, recomputed from rt.last_status as needed. */
+
+        if (initial_pending && client_worker_is_idle(&rt)) {
+            if (client_turn_submit(&rt, initial_pending)) {
+                free(initial_pending);
+                initial_pending = NULL;
+            }
+        }
+
+        if (!initial_pending && queue.len && client_worker_is_idle(&rt)) {
+            char *echo = agent_prompt_queue_take_all_echo(&queue);
+            char *queued = agent_prompt_queue_take_all(&queue);
+            if (client_turn_submit(&rt, queued)) {
+                linenoiseHistoryAdd(queued);
+                linenoiseHistorySave(histpath);
+                if (echo) g_render_sink(echo, strlen(echo));
+                client_runtime_refresh_footer(&rt);
+            } else {
+                agent_prompt_queue_push_front(&queue, queued);
+                queued = NULL;
+            }
+            free(echo);
+            free(queued);
+        }
+
+        if (queue.len && editor_take_queued_byte(&editor, 24)) { /* Ctrl+X */
+            char *queued = agent_prompt_queue_pop(&queue);
+            editor_replace_input(&editor, queued);
+            client_runtime_refresh_footer(&rt);
+            free(queued);
+        }
+        if (queue.len && !client_worker_is_idle(&rt) && editor_take_bare_escape(&editor)) {
+            pthread_mutex_lock(&w.mu);
+            w.interrupt_requested = true;
+            pthread_mutex_unlock(&w.mu);
+            client_worker_interrupt(&rt);
+        }
+
+        if (!editor.paste_open && !editor.paste_start_pending &&
+            linenoiseEditQueuedInput(&editor.edit) > 0)
+        {
+            if (editor.hidden) editor_show(&editor);
+            errno = 0;
+            char *line = linenoiseEditFeed(&editor.edit);
+            if (line == linenoiseEditMore) {
+                /* Still editing. */
+            } else if (!line) {
+                if (errno == EAGAIN) {
+                    if (!client_worker_is_idle(&rt)) {
+                        pthread_mutex_lock(&w.mu);
+                        w.interrupt_requested = true;
+                        pthread_mutex_unlock(&w.mu);
+                        client_worker_interrupt(&rt);
+                    } else {
+                        editor_cancel_input_with_hint(&editor, prompt, statusline);
+                    }
+                } else {
+                    running = false;
+                }
+            } else {
+                char *cmd = line;
+                while (*cmd == ' ' || *cmd == '\t' || *cmd == '\r' || *cmd == '\n') cmd++;
+                char *end = cmd + strlen(cmd);
+                while (end > cmd && (end[-1] == ' ' || end[-1] == '\t' ||
+                                     end[-1] == '\r' || end[-1] == '\n')) end--;
+                *end = '\0';
+
+                bool was_below_output = editor.prompt_below_output;
+                bool had_output_line_open = editor.output_line_open;
+                int saved_output_col = editor.output_col;
+                editor_stop(&editor);
+                bool busy = !client_worker_is_idle(&rt);
+                char cmderr[192] = {0};
+                if (!cmd[0]) {
+                    /* Empty input: just reopen the editor. */
+                } else if (!strcmp(cmd, "/help")) {
+                    runtime_help();
+                } else if (!strcmp(cmd, "/save")) {
+                    bool scheduled = false;
+                    if (!client_session_save(&rt, &scheduled, cmderr, sizeof(cmderr)))
+                        printf("save failed: %s\n", cmderr);
+                    else if (scheduled)
+                        printf("save scheduled at next safe point\n");
+                    else
+                        client_refresh_session_list(&rt, cmderr, sizeof(cmderr));
+                } else if (!strcmp(cmd, "/compact")) {
+                    ap_buf cb;
+                    ap_buf_init(&cb);
+                    ap_encode_session_simple(&cb, AGENT_SESSION_COMPACT);
+                    conn_send(co, AGENT_MSG_SESSION, &cb);
+                    ap_buf_free(&cb);
+                    if (busy) printf("compaction scheduled at next safe point\n");
+                } else if (!strcmp(cmd, "/list")) {
+                    client_print_session_list(&rt);
+                } else if (!strncmp(cmd, "/power", 6) &&
+                           (cmd[6] == '\0' || cmd[6] == ' ' || cmd[6] == '\t')) {
+                    char *arg = cmd + 6;
+                    while (*arg == ' ' || *arg == '\t') arg++;
+                    if (!arg[0]) {
+                        printf("usage: /power <1..100>\n");
+                    } else {
+                        int power = 0;
+                        if (!parse_power_percent(arg, &power)) {
+                            printf("usage: /power <1..100>\n");
+                        } else if (!client_power_set(&rt, power, cmderr, sizeof(cmderr))) {
+                            printf("power failed: %s\n", cmderr);
+                        }
+                    }
+                } else if (agent_slash_command_with_args(cmd, "/hints")) {
+                    char *arg = cmd + strlen("/hints");
+                    while (*arg == ' ' || *arg == '\t') arg++;
+                    bool enabled;
+                    if (!agent_parse_hints(arg, &enabled)) {
+                        printf("usage: /hints on|off\n");
+                    } else if (!client_hints_set(&rt, enabled, cmderr, sizeof(cmderr))) {
+                        printf("hints failed: %s\n", cmderr);
+                    } else {
+                        printf("hints %s (applies at the next conversation boundary)\n",
+                               enabled ? "on" : "off");
+                    }
+                } else if (!strncmp(cmd, "/steer", 6) &&
+                           (cmd[6] == '\0' || cmd[6] == ' ' || cmd[6] == '\t')) {
+                    if (busy) {
+                        printf("command requires the model to be idle: %s\n", cmd);
+                    } else {
+                        char *arg = cmd + 6;
+                        while (*arg == ' ' || *arg == '\t') arg++;
+                        if (!arg[0]) {
+                            float cur = 0.0f;
+                            if (client_steer_get(&rt, &cur, cmderr, sizeof(cmderr)))
+                                printf("Steering FFN: %g.\n", (double)cur);
+                            else
+                                printf("steer failed: %s\n", cmderr);
+                        } else {
+                            float scale = 0.0f;
+                            if (!parse_steering_level(arg, &scale)) {
+                                printf("usage: /steer <-100..100>\n");
+                            } else if (client_steer_set(&rt, scale, cmderr, sizeof(cmderr))) {
+                                printf("Steering FFN: %g.\n", (double)scale);
+                            } else {
+                                printf("steer failed: %s\n", cmderr);
+                            }
+                        }
+                    }
+                } else if (cmd[0] == '/' && !agent_slash_command_known(cmd)) {
+                    ssize_t ignored = write(STDOUT_FILENO, "\a", 1);
+                    (void)ignored;
+                    restore_line = xstrdup(cmd);
+                } else if (cmd[0] == '/' && busy) {
+                    printf("command requires the model to be idle: %s\n", cmd);
+                } else if (!strcmp(cmd, "/quit") || !strcmp(cmd, "/exit")) {
+                    editor_restore_terminal_layout(&editor);
+                    agent_exit_save_result exit_save =
+                        client_maybe_save_before_exiting(&rt);
+                    if (exit_save == AGENT_EXIT_NOW) {
+                        exit(0);
+                    } else if (exit_save == AGENT_EXIT_CLEAN) {
+                        exit_save_handled = true;
+                        running = false;
+                    } else {
+                        editor_start(&editor, prompt, statusline, NULL);
+                    }
+                } else if (!strcmp(cmd, "/new")) {
+                    editor_restore_terminal_layout(&editor);
+                    if (client_maybe_save_before_leaving_session(&rt)) {
+                        if (!client_session_new(&rt, cfg, cmderr, sizeof(cmderr))) {
+                            printf("new session failed: %s\n", cmderr);
+                        } else {
+                            show_welcome_after_restart = true;
+                        }
+                    }
+                } else if (!strncmp(cmd, "/switch", 7) &&
+                           (cmd[7] == '\0' || cmd[7] == ' ' || cmd[7] == '\t')) {
+                    char *arg = cmd + 7;
+                    while (*arg == ' ' || *arg == '\t') arg++;
+                    if (!arg[0]) {
+                        printf("usage: /switch <sha-prefix>\n");
+                    } else {
+                        editor_restore_terminal_layout(&editor);
+                        if (client_maybe_save_before_leaving_session(&rt)) {
+                            char *sha = arg;
+                            while (*arg && *arg != ' ' && *arg != '\t') arg++;
+                            if (*arg) *arg = '\0';
+                            if (!client_session_switch(&rt, sha, AGENT_HISTORY_DEFAULT_TURNS,
+                                                       cmderr, sizeof(cmderr))) {
+                                printf("switch failed: %s\n", cmderr);
+                            } else {
+                                client_refresh_session_list(&rt, cmderr, sizeof(cmderr));
+                                force_status_redraw_after_restart = true;
+                            }
+                        }
+                    }
+                } else if (!strncmp(cmd, "/del", 4) &&
+                           (cmd[4] == '\0' || cmd[4] == ' ' || cmd[4] == '\t')) {
+                    char *arg = cmd + 4;
+                    while (*arg == ' ' || *arg == '\t') arg++;
+                    if (!arg[0]) {
+                        printf("usage: /del <sha-prefix>\n");
+                    } else {
+                        char sha[AP_CAP_SHA] = {0};
+                        if (client_session_del(&rt, arg, false, sha, sizeof(sha),
+                                               NULL, cmderr, sizeof(cmderr))) {
+                            printf("deleted session %.8s\n", sha);
+                            client_refresh_session_list(&rt, cmderr, sizeof(cmderr));
+                        } else {
+                            printf("delete failed: %s\n", cmderr);
+                        }
+                    }
+                } else if (!strncmp(cmd, "/strip", 6) &&
+                           (cmd[6] == '\0' || cmd[6] == ' ' || cmd[6] == '\t')) {
+                    char *arg = cmd + 6;
+                    while (*arg == ' ' || *arg == '\t') arg++;
+                    if (!arg[0]) {
+                        printf("usage: /strip <sha-prefix>\n");
+                    } else {
+                        char sha[AP_CAP_SHA] = {0};
+                        uint32_t tokens = 0;
+                        if (client_session_del(&rt, arg, true, sha, sizeof(sha),
+                                               &tokens, cmderr, sizeof(cmderr))) {
+                            printf("stripped session %.8s (%u tokens)\n", sha, tokens);
+                            client_refresh_session_list(&rt, cmderr, sizeof(cmderr));
+                        } else {
+                            printf("strip failed: %s\n", cmderr);
+                        }
+                    }
+                } else if (!strncmp(cmd, "/history", 8) &&
+                           (cmd[8] == '\0' || cmd[8] == ' ' || cmd[8] == '\t')) {
+                    char *arg = cmd + 8;
+                    while (*arg == ' ' || *arg == '\t') arg++;
+                    int history_turns = arg[0] ?
+                        agent_parse_int_default(arg, AGENT_HISTORY_DEFAULT_TURNS,
+                                                1, AGENT_HISTORY_MAX_TURNS) :
+                        AGENT_HISTORY_DEFAULT_TURNS;
+                    if (!client_session_show_history(&rt, (uint32_t)history_turns,
+                                                     cmderr, sizeof(cmderr)))
+                        printf("history failed: %s\n", cmderr);
+                } else if (busy) {
+                    agent_prompt_queue_push(&queue, cmd);
+                } else {
+                    linenoiseHistoryAdd(cmd);
+                    linenoiseHistorySave(histpath);
+                    if (client_turn_submit(&rt, cmd)) {
+                        agent_echo_user_prompt(cmd);
+                    } else {
+                        restore_line = xstrdup(cmd);
+                    }
+                }
+                linenoiseFree(line);
+
+                if (running) {
+                    client_status_from_wire(&rt.last_status, &st);
+                    build_prompt_text(&st, prompt, sizeof(prompt));
+                    int restart_cols = editor.term_cols > 0 ? editor.term_cols : 80;
+                    build_footer_text(&st, &queue, restart_cols, statusline, sizeof(statusline));
+                    editor_start(&editor, prompt, statusline, restore_line);
+                    if (!editor.scroll_region && was_below_output) {
+                        editor.output_line_open = had_output_line_open;
+                        editor.prompt_below_output = was_below_output;
+                        editor.output_col = saved_output_col;
+                    }
+                    if (show_welcome_after_restart) {
+                        editor_write_welcome_banner(&editor, (int)rt.last_status.ctx_size,
+                                                    prompt, statusline);
+                        show_welcome_after_restart = false;
+                    }
+                    if (force_status_redraw_after_restart) {
+                        editor_write_async(&editor, "", 0, prompt, statusline, true);
+                        force_status_redraw_after_restart = false;
+                    }
+                    free(restore_line);
+                    restore_line = NULL;
+                }
+            }
+        }
+    }
+
+    free(initial_pending);
+    free(restore_line);
+    agent_prompt_queue_free(&queue);
+    if (!disconnected) {
+        editor_stop(&editor);
+        editor_restore_terminal_layout(&editor);
+    }
+    g_active_editor = NULL;
+    linenoiseSetCompletionCallback(NULL);
+    g_completion_runtime = NULL;
+    if (!exit_save_handled) {
+        agent_exit_save_result exit_save = client_maybe_save_before_exiting(&rt);
+        if (exit_save == AGENT_EXIT_NOW) exit(0);
+    }
+    client_runtime_free(&rt);
+    client_worker_free(&w);
+    return rc;
+}
+
 #ifndef DS4_AGENT_CLIENT_TEST_NO_MAIN
 int main(int argc, char **argv) {
     client_config cfg = client_parse_options(argc, argv);
@@ -6720,14 +7412,19 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    fprintf(stderr,
-            "ds4-agent-client: connected to %s:%d — %s on %s, ctx %u (%s). "
-            "The UI loop lands in T9-T11.\n",
-            cfg.server_host, cfg.server_port,
-            sess.caps.model_name[0] ? sess.caps.model_name : "model",
-            sess.caps.backend_name[0] ? sess.caps.backend_name : "?",
-            sess.ready.ctx_size,
-            sess.resumed ? "resumed parked session" : "new session");
+    struct sigaction old_int;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sigemptyset(&sa.sa_mask);
+    sa.sa_handler = agent_sigint_handler;
+    bool sigint_installed = !cfg.non_interactive &&
+        sigaction(SIGINT, &sa, &old_int) == 0;
+
+    int rc = cfg.non_interactive ?
+        run_client_non_interactive(&co, &cfg, &sess) :
+        run_client_interactive(&co, &cfg, &sess);
+
+    if (sigint_installed) sigaction(SIGINT, &old_int, NULL);
 
     {
         ap_buf b;
@@ -6738,6 +7435,6 @@ int main(int argc, char **argv) {
     conn_free(&co);
     if (trace) fclose(trace);
     client_config_free(&cfg);
-    return 0;
+    return rc;
 }
 #endif
