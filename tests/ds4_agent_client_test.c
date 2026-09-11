@@ -737,6 +737,54 @@ static void test_tool_calls_over_wire(void) {
     free(dir);
 }
 
+/* ---- T11a: welcome banner + footer/queue text ------------------------- */
+
+static void test_welcome_banner(void) {
+    char buf[256];
+    agent_format_welcome_banner(100000, buf, sizeof(buf));
+    CHECK(strstr(buf, "100k") != NULL);
+    CHECK(strstr(buf, "DwarfStar") != NULL || strstr(buf, "Dwarf") != NULL);
+}
+
+static void test_footer_with_queue(void) {
+    ap_status w = {0};
+    w.state = AGENT_STATE_GENERATING;
+    w.ctx_used = 1000;
+    w.ctx_size = 100000;
+    agent_status st;
+    client_status_from_wire(&w, &st);
+
+    agent_prompt_queue q = {0};
+    agent_prompt_queue_push(&q, "next thing to do");
+    /* build_footer_text only renders a queue preview once the buffer is more
+     * than 1024 bytes past its own overhead (len - 1024 budget). */
+    char buf[2048];
+    build_footer_text(&st, &q, 80, buf, sizeof(buf));
+    CHECK(strstr(buf, "queued:") != NULL);
+    CHECK(strstr(buf, "next thing to do") != NULL);
+    CHECK(strstr(buf, "generation") != NULL);
+    CHECK(agent_footer_is_multiline(buf));
+
+    /* no queue -> just the status line */
+    char buf2[512];
+    build_footer_text(&st, NULL, 80, buf2, sizeof(buf2));
+    CHECK(!agent_footer_is_multiline(buf2));
+    CHECK(strstr(buf2, "generation") != NULL);
+
+    agent_prompt_queue_free(&q);
+}
+
+static void test_prompt_queue_take_all(void) {
+    agent_prompt_queue q = {0};
+    agent_prompt_queue_push(&q, "first");
+    agent_prompt_queue_push(&q, "second");
+    char *joined = agent_prompt_queue_take_all(&q);
+    CHECK(joined != NULL);
+    CHECK(strstr(joined, "first") != NULL && strstr(joined, "second") != NULL);
+    CHECK(q.len == 0);
+    free(joined);
+}
+
 int main(void) {
     test_handshake_new_session();
     test_handshake_resume();
@@ -756,6 +804,9 @@ int main(void) {
     test_fit_context_bucket_on_ctx_size();
     test_drain_reply_bash_jobs_note();
     test_tool_calls_over_wire();
+    test_welcome_banner();
+    test_footer_with_queue();
+    test_prompt_queue_take_all();
 
     if (failures) {
         fprintf(stderr, "%d agent client test(s) failed\n", failures);
