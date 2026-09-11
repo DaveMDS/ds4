@@ -1067,6 +1067,376 @@ static void test_refresh_session_list(void) {
     rt_teardown(&rt, &co, &w, sv);
 }
 
+/* ---- T11c-a: command layer -- RPC wrappers + local mirrors ------------- */
+
+static void mock_send_config_reply(int fd, bool ok, uint32_t value, const char *error) {
+    ap_buf b;
+    ap_buf_init(&b);
+    ap_map_writer mw;
+    ap_put_reply_map_begin(&b, &mw);
+    ap_map_put_bool(&mw, "ok", ok);
+    ap_map_put_u32(&mw, "value", value);
+    ap_map_put_cstr(&mw, "error", error ? error : "");
+    ap_map_end(&mw);
+    mock_send(fd, AGENT_MSG_CONFIG, &b);
+    ap_buf_free(&b);
+}
+
+static void mock_send_save_reply(int fd, bool ok, bool scheduled, const char *sha,
+                                 uint32_t tokens, const char *error) {
+    ap_buf b;
+    ap_buf_init(&b);
+    ap_map_writer mw;
+    ap_put_reply_map_begin(&b, &mw);
+    ap_map_put_bool(&mw, "ok", ok);
+    ap_map_put_bool(&mw, "scheduled", scheduled);
+    ap_map_put_cstr(&mw, "sha", sha ? sha : "");
+    ap_map_put_u32(&mw, "tokens", tokens);
+    ap_map_put_cstr(&mw, "error", error ? error : "");
+    ap_map_end(&mw);
+    mock_send(fd, AGENT_MSG_SESSION, &b);
+    ap_buf_free(&b);
+}
+
+static void mock_send_switch_reply(int fd, bool ok, const char *sha, const char *title,
+                                   uint32_t ctx_used, const char *error) {
+    ap_buf b;
+    ap_buf_init(&b);
+    ap_map_writer mw;
+    ap_put_reply_map_begin(&b, &mw);
+    ap_map_put_bool(&mw, "ok", ok);
+    ap_map_put_cstr(&mw, "sha", sha ? sha : "");
+    ap_map_put_cstr(&mw, "title", title ? title : "");
+    ap_map_put_u32(&mw, "ctx_used", ctx_used);
+    ap_map_put_cstr(&mw, "error", error ? error : "");
+    ap_map_end(&mw);
+    mock_send(fd, AGENT_MSG_SESSION, &b);
+    ap_buf_free(&b);
+}
+
+static void mock_send_del_reply(int fd, bool ok, const char *sha, uint32_t tokens,
+                                const char *error) {
+    ap_buf b;
+    ap_buf_init(&b);
+    ap_map_writer mw;
+    ap_put_reply_map_begin(&b, &mw);
+    ap_map_put_bool(&mw, "ok", ok);
+    ap_map_put_cstr(&mw, "sha", sha ? sha : "");
+    ap_map_put_u32(&mw, "tokens", tokens);
+    ap_map_put_cstr(&mw, "error", error ? error : "");
+    ap_map_end(&mw);
+    mock_send(fd, AGENT_MSG_SESSION, &b);
+    ap_buf_free(&b);
+}
+
+static void test_turn_submit_idle_gate(void) {
+    client_runtime rt;
+    client_conn co;
+    agent_worker w;
+    agent_token_renderer r;
+    int sv[2];
+    rt_setup(&rt, &co, &w, &r, sv);
+
+    /* not idle yet (no STATUS seen) -> rejected without sending anything */
+    CHECK(!client_turn_submit(&rt, "hello"));
+
+    rt.have_status = true;
+    rt.last_status.state = AGENT_STATE_GENERATING;
+    CHECK(!client_turn_submit(&rt, "hello"));
+
+    rt.last_status.state = AGENT_STATE_IDLE;
+    CHECK(client_turn_submit(&rt, "hello"));
+    CHECK(rt.activity_since_save);
+
+    ap_buf rx;
+    ap_buf_init(&rx);
+    mock_drain(sv[1], &rx);
+    uint32_t type = 0;
+    ap_buf payload;
+    ap_buf_init(&payload);
+    char ferr[128] = {0};
+    CHECK(ap_read_frame(&rx, &type, &payload, ferr, sizeof(ferr)) == AP_FRAME_OK);
+    CHECK(type == AGENT_MSG_TURN);
+    ap_reader rd;
+    ap_reader_init(&rd, payload.data, payload.len);
+    ap_turn t;
+    CHECK(ap_decode_turn(&rd, &t));
+    CHECK(t.text_len == strlen("hello"));
+    CHECK(memcmp(t.text, "hello", 5) == 0);
+
+    ap_buf_free(&payload);
+    ap_buf_free(&rx);
+    rt_teardown(&rt, &co, &w, sv);
+}
+
+static void test_worker_interrupt_sends_frame(void) {
+    client_runtime rt;
+    client_conn co;
+    agent_worker w;
+    agent_token_renderer r;
+    int sv[2];
+    rt_setup(&rt, &co, &w, &r, sv);
+
+    client_worker_interrupt(&rt);
+
+    ap_buf rx;
+    ap_buf_init(&rx);
+    mock_drain(sv[1], &rx);
+    uint32_t type = 0;
+    ap_buf payload;
+    ap_buf_init(&payload);
+    char ferr[128] = {0};
+    CHECK(ap_read_frame(&rx, &type, &payload, ferr, sizeof(ferr)) == AP_FRAME_OK);
+    CHECK(type == AGENT_MSG_INTERRUPT);
+
+    ap_buf_free(&payload);
+    ap_buf_free(&rx);
+    rt_teardown(&rt, &co, &w, sv);
+}
+
+static void test_config_rpc_power_and_error(void) {
+    client_runtime rt;
+    client_conn co;
+    agent_worker w;
+    agent_token_renderer r;
+    int sv[2];
+    rt_setup(&rt, &co, &w, &r, sv);
+
+    mock_send_config_reply(sv[1], true, 55, NULL);
+    char err[192] = {0};
+    CHECK(client_power_set(&rt, 55, err, sizeof(err)));
+    CHECK(err[0] == '\0');
+
+    mock_send_config_reply(sv[1], false, 0, "power must be 1..100");
+    CHECK(!client_power_set(&rt, 200, err, sizeof(err)));
+    CHECK(strstr(err, "1..100") != NULL);
+
+    rt_teardown(&rt, &co, &w, sv);
+}
+
+static void test_config_rpc_steer_roundtrip(void) {
+    client_runtime rt;
+    client_conn co;
+    agent_worker w;
+    agent_token_renderer r;
+    int sv[2];
+    rt_setup(&rt, &co, &w, &r, sv);
+
+    mock_send_config_reply(sv[1], true, ap_milli_from_double(12.5), NULL);
+    char err[192] = {0};
+    float scale = 0.0f;
+    CHECK(client_steer_get(&rt, &scale, err, sizeof(err)));
+    CHECK(scale > 12.4f && scale < 12.6f);
+
+    mock_send_config_reply(sv[1], true, ap_milli_from_double(-40.0), NULL);
+    CHECK(client_steer_set(&rt, -40.0f, err, sizeof(err)));
+
+    rt_teardown(&rt, &co, &w, sv);
+}
+
+static void test_config_rpc_hints(void) {
+    client_runtime rt;
+    client_conn co;
+    agent_worker w;
+    agent_token_renderer r;
+    int sv[2];
+    rt_setup(&rt, &co, &w, &r, sv);
+
+    mock_send_config_reply(sv[1], true, 1, NULL);
+    char err[192] = {0};
+    CHECK(client_hints_set(&rt, true, err, sizeof(err)));
+
+    rt_teardown(&rt, &co, &w, sv);
+}
+
+static void test_session_save_immediate_and_scheduled(void) {
+    client_runtime rt;
+    client_conn co;
+    agent_worker w;
+    agent_token_renderer r;
+    int sv[2];
+    rt_setup(&rt, &co, &w, &r, sv);
+    rt.activity_since_save = true;
+
+    mock_send_save_reply(sv[1], true, false,
+                         "cccccccccccccccccccccccccccccccccccccccc", 42, NULL);
+    char err[192] = {0};
+    bool scheduled = true;
+    CHECK(client_session_save(&rt, &scheduled, err, sizeof(err)));
+    CHECK(!scheduled);
+    CHECK(!rt.activity_since_save);
+    CHECK(strcmp(rt.current_sha, "cccccccccccccccccccccccccccccccccccccccc") == 0);
+
+    rt.activity_since_save = true;
+    mock_send_save_reply(sv[1], true, true, "", 0, NULL);
+    scheduled = false;
+    CHECK(client_session_save(&rt, &scheduled, err, sizeof(err)));
+    CHECK(scheduled);
+    CHECK(rt.activity_since_save); /* not cleared: the save hasn't run yet */
+
+    rt_teardown(&rt, &co, &w, sv);
+}
+
+static void test_session_switch_updates_identity(void) {
+    client_runtime rt;
+    client_conn co;
+    agent_worker w;
+    agent_token_renderer r;
+    int sv[2];
+    rt_setup(&rt, &co, &w, &r, sv);
+    rt.activity_since_save = true;
+
+    mock_send_switch_reply(sv[1], true,
+                           "dddddddddddddddddddddddddddddddddddddddd",
+                           "other session", 77, NULL);
+    char err[192] = {0};
+    CHECK(client_session_switch(&rt, "dddd", AGENT_HISTORY_DEFAULT_TURNS, err, sizeof(err)));
+    CHECK(strcmp(rt.current_sha, "dddddddddddddddddddddddddddddddddddddddd") == 0);
+    CHECK(strcmp(rt.current_title, "other session") == 0);
+    CHECK(!rt.activity_since_save);
+
+    mock_send_switch_reply(sv[1], false, "", "", 0, "no such session");
+    CHECK(!client_session_switch(&rt, "ffff", 0, err, sizeof(err)));
+    CHECK(strstr(err, "no such session") != NULL);
+
+    rt_teardown(&rt, &co, &w, sv);
+}
+
+static void test_session_show_history_requires_identity(void) {
+    client_runtime rt;
+    client_conn co;
+    agent_worker w;
+    agent_token_renderer r;
+    int sv[2];
+    rt_setup(&rt, &co, &w, &r, sv);
+
+    /* no sha yet -> rejected locally, nothing sent on the wire */
+    char err[192] = {0};
+    CHECK(!client_session_show_history(&rt, 5, err, sizeof(err)));
+    CHECK(err[0] != '\0');
+
+    ap_buf rx;
+    ap_buf_init(&rx);
+    mock_drain(sv[1], &rx);
+    CHECK(rx.len == 0);
+    ap_buf_free(&rx);
+
+    snprintf(rt.current_sha, sizeof(rt.current_sha), "%s",
+             "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+    rt.activity_since_save = true;
+    mock_send_switch_reply(sv[1], true, rt.current_sha, "same session", 9, NULL);
+    CHECK(client_session_show_history(&rt, 5, err, sizeof(err)));
+    /* a self-referencing history dump must not look like a discarding switch */
+    CHECK(rt.activity_since_save);
+
+    rt_teardown(&rt, &co, &w, sv);
+}
+
+static void test_session_del_and_strip(void) {
+    client_runtime rt;
+    client_conn co;
+    agent_worker w;
+    agent_token_renderer r;
+    int sv[2];
+    rt_setup(&rt, &co, &w, &r, sv);
+
+    mock_send_del_reply(sv[1], true,
+                        "ffffffffffffffffffffffffffffffffffffffff", 0, NULL);
+    char sha[64] = {0};
+    uint32_t tokens = 0;
+    char err[192] = {0};
+    CHECK(client_session_del(&rt, "ffff", false, sha, sizeof(sha), &tokens, err, sizeof(err)));
+    CHECK(strcmp(sha, "ffffffffffffffffffffffffffffffffffffffff") == 0);
+
+    mock_send_del_reply(sv[1], true,
+                        "1111111111111111111111111111111111111111", 321, NULL);
+    CHECK(client_session_del(&rt, "1111", true, sha, sizeof(sha), &tokens, err, sizeof(err)));
+    CHECK(tokens == 321);
+
+    rt_teardown(&rt, &co, &w, sv);
+}
+
+static void test_session_new_mid_session(void) {
+    client_runtime rt;
+    client_conn co;
+    agent_worker w;
+    agent_token_renderer r;
+    int sv[2];
+    rt_setup(&rt, &co, &w, &r, sv);
+    snprintf(rt.current_sha, sizeof(rt.current_sha), "stale");
+    rt.activity_since_save = true;
+
+    ap_session_ready ready = make_ready();
+    ap_buf b;
+    ap_buf_init(&b);
+    ap_encode_session_ready(&b, &ready);
+    mock_send(sv[1], AGENT_MSG_SESSION, &b);
+    ap_buf_free(&b);
+
+    client_config cfg = {0};
+    snprintf(cfg.server_host, sizeof(cfg.server_host), "127.0.0.1");
+    char err[192] = {0};
+    CHECK(client_session_new(&rt, &cfg, err, sizeof(err)));
+    CHECK(rt.current_sha[0] == '\0');
+    CHECK(!rt.activity_since_save);
+    CHECK(rt.have_status);
+    CHECK(rt.last_status.state == ready.state);
+    CHECK(rt.last_status.ctx_size == ready.ctx_size);
+
+    rt_teardown(&rt, &co, &w, sv);
+}
+
+static void test_switch_completion_from_cache(void) {
+    client_runtime rt;
+    client_conn co;
+    agent_worker w;
+    agent_token_renderer r;
+    int sv[2];
+    rt_setup(&rt, &co, &w, &r, sv);
+
+    client_session_list_push(&rt.sessions, (client_session_row){
+        .sha = "aa11111111111111111111111111111111111111", .title = "a" });
+    client_session_list_push(&rt.sessions, (client_session_row){
+        .sha = "ab22222222222222222222222222222222222222", .title = "b" });
+    client_session_list_push(&rt.sessions, (client_session_row){
+        .sha = "cc33333333333333333333333333333333333333", .title = "c" });
+
+    g_completion_runtime = &rt;
+    linenoiseCompletions lc = {0};
+    client_switch_completion_callback("/switch a", &lc);
+    CHECK(lc.len == 2);
+    for (size_t i = 0; i < lc.len; i++) free(lc.cvec[i]);
+    free(lc.cvec);
+
+    linenoiseCompletions lc2 = {0};
+    client_switch_completion_callback("/not-switch", &lc2);
+    CHECK(lc2.len == 0);
+
+    g_completion_runtime = NULL;
+    rt_teardown(&rt, &co, &w, sv);
+}
+
+static void test_save_prompt_helpers_skip_when_clean(void) {
+    client_runtime rt;
+    client_conn co;
+    agent_worker w;
+    agent_token_renderer r;
+    int sv[2];
+    rt_setup(&rt, &co, &w, &r, sv);
+    rt.activity_since_save = false; /* nothing to save -> no prompt, no RPC */
+
+    CHECK(client_maybe_save_before_leaving_session(&rt));
+    CHECK(client_maybe_save_before_exiting(&rt) == AGENT_EXIT_CLEAN);
+
+    ap_buf rx;
+    ap_buf_init(&rx);
+    mock_drain(sv[1], &rx);
+    CHECK(rx.len == 0);
+    ap_buf_free(&rx);
+
+    rt_teardown(&rt, &co, &w, sv);
+}
+
 int main(void) {
     test_handshake_new_session();
     test_handshake_resume();
@@ -1095,6 +1465,18 @@ int main(void) {
     test_dispatch_push_drain_request_with_no_queue();
     test_rpc_dispatches_pushes_before_reply();
     test_refresh_session_list();
+    test_turn_submit_idle_gate();
+    test_worker_interrupt_sends_frame();
+    test_config_rpc_power_and_error();
+    test_config_rpc_steer_roundtrip();
+    test_config_rpc_hints();
+    test_session_save_immediate_and_scheduled();
+    test_session_switch_updates_identity();
+    test_session_show_history_requires_identity();
+    test_session_del_and_strip();
+    test_session_new_mid_session();
+    test_switch_completion_from_cache();
+    test_save_prompt_helpers_skip_when_clean();
 
     if (failures) {
         fprintf(stderr, "%d agent client test(s) failed\n", failures);

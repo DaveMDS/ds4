@@ -6050,6 +6050,15 @@ typedef struct {
     ap_status last_status;
     bool have_status;
     client_session_list sessions;
+
+    /* Current session identity, learned from a save/switch/new reply or from
+     * the is_current row of a refreshed session list. Empty until the first
+     * save -- a session the server has never written to disk has no sha. */
+    char current_sha[AP_CAP_SHA];
+    char current_title[AP_CAP_TITLE];
+    /* Replaces ds4_agent.c's agent_worker_needs_save: set on every submitted
+     * TURN, cleared on a completed (non-scheduled) save/switch/new. */
+    bool activity_since_save;
 } client_runtime;
 
 static void client_runtime_init(client_runtime *rt, client_conn *co,
@@ -6105,6 +6114,11 @@ static void client_dispatch_push(client_runtime *rt, uint32_t type,
         rt->last_status = w;
         rt->have_status = true;
         if (was_busy && now_terminal) client_stream_renderer_finish(&rt->stream);
+        if (now_terminal && w.error[0]) {
+            char msg[AP_CAP_ERROR + 32];
+            int n = snprintf(msg, sizeof(msg), "\nds4-agent: %s\n", w.error);
+            if (n > 0) g_render_sink(msg, (size_t)n);
+        }
         client_runtime_refresh_footer(rt);
         break;
     }
@@ -6210,6 +6224,456 @@ static void client_editor_sink(const char *s, size_t n) {
     }
 }
 
+
+/* ========================================================================= */
+/* T11c-a: command layer -- RPC wrappers for every SESSION/CONFIG slash       */
+/* command, the client-local session-state mirror, and small helpers copied   */
+/* verbatim from ds4_agent.c (sigint flag, slash-command parsing, argument    */
+/* validation). The interactive/non-interactive loop and main() that drive    */
+/* these are T11c-b.                                                         */
+/* ========================================================================= */
+
+/* -- copied verbatim from ds4_agent.c ------------------------------- */
+
+static volatile sig_atomic_t agent_sigint;
+
+static void agent_sigint_handler(int sig) {
+    (void)sig;
+    agent_sigint = 1;
+}
+
+/* parse_power_percent / parse_steering_level already live in
+ * ds4_agent_utils.[ch] (shared with the server). */
+
+static bool agent_slash_command_with_args(const char *cmd, const char *name) {
+    size_t len = strlen(name);
+    return !strncmp(cmd, name, len) &&
+           (cmd[len] == '\0' || isspace((unsigned char)cmd[len]));
+}
+
+static bool agent_slash_command_known(const char *cmd) {
+    return !strcmp(cmd, "/help") ||
+           !strcmp(cmd, "/save") ||
+           !strcmp(cmd, "/compact") ||
+           !strcmp(cmd, "/list") ||
+           !strcmp(cmd, "/quit") ||
+           !strcmp(cmd, "/exit") ||
+           !strcmp(cmd, "/new") ||
+           agent_slash_command_with_args(cmd, "/power") ||
+           agent_slash_command_with_args(cmd, "/steer") ||
+           agent_slash_command_with_args(cmd, "/hints") ||
+           agent_slash_command_with_args(cmd, "/switch") ||
+           agent_slash_command_with_args(cmd, "/del") ||
+           agent_slash_command_with_args(cmd, "/strip") ||
+           agent_slash_command_with_args(cmd, "/history");
+}
+
+static bool agent_parse_hints(const char *arg, bool *enabled) {
+    if (!strcmp(arg, "on")) *enabled = true;
+    else if (!strcmp(arg, "off")) *enabled = false;
+    else return false;
+    return true;
+}
+
+static void build_prompt_text(const agent_status *st, char *buf, size_t len) {
+    (void)st;
+    snprintf(buf, len, "ds4-agent> ");
+}
+
+#define AGENT_HISTORY_DEFAULT_TURNS 3
+#define AGENT_HISTORY_MAX_TURNS 200
+
+static void agent_format_age(uint64_t when, char *buf, size_t len) {
+    uint64_t now = (uint64_t)time(NULL);
+    uint64_t age = when && now > when ? now - when : 0;
+    if (age < 60) snprintf(buf, len, "%llus ago", (unsigned long long)age);
+    else if (age < 3600) snprintf(buf, len, "%llum ago", (unsigned long long)(age / 60));
+    else if (age < 86400) snprintf(buf, len, "%lluh ago", (unsigned long long)(age / 3600));
+    else snprintf(buf, len, "%llud ago", (unsigned long long)(age / 86400));
+}
+
+typedef enum {
+    AGENT_EXIT_CANCEL,
+    AGENT_EXIT_CLEAN,
+    AGENT_EXIT_NOW,
+} agent_exit_save_result;
+
+/* -- turn submission / interrupt ------------------------------------- */
+
+/* Mirrors ds4_agent.c's worker_submit: false means "still busy, queue it
+ * instead" -- checked against the client's local STATUS mirror, same as the
+ * in-process worker's own idle check. The server double-checks and would
+ * reply with a transient STATUS{error="busy"} if the two ever disagree. */
+static bool client_worker_is_idle(const client_runtime *rt) {
+    return rt->have_status && rt->last_status.state == AGENT_STATE_IDLE;
+}
+
+static bool client_turn_submit(client_runtime *rt, const char *text) {
+    if (!client_worker_is_idle(rt)) return false;
+    ap_turn t = { .text = text, .text_len = strlen(text) };
+    ap_buf body;
+    ap_buf_init(&body);
+    ap_encode_turn(&body, &t);
+    bool ok = conn_send(rt->co, AGENT_MSG_TURN, &body);
+    ap_buf_free(&body);
+    if (ok) rt->activity_since_save = true;
+    return ok;
+}
+
+static void client_worker_interrupt(client_runtime *rt) {
+    ap_buf empty;
+    ap_buf_init(&empty);
+    conn_send(rt->co, AGENT_MSG_INTERRUPT, &empty);
+    ap_buf_free(&empty);
+}
+
+/* -- CONFIG RPC: power / steer / hints -------------------------------- */
+
+static bool client_config_rpc(client_runtime *rt, uint32_t key, uint32_t op,
+                              uint32_t u32val, bool boolval,
+                              uint32_t *value_out, char *err, size_t errlen) {
+    ap_buf body;
+    ap_buf_init(&body);
+    if (op == AGENT_CONFIG_SET) {
+        if (key == AGENT_CONFIG_HINTS) ap_encode_config_set_bool(&body, key, boolval);
+        else ap_encode_config_set_u32(&body, key, u32val);
+    } else {
+        ap_encode_config_get(&body, key);
+    }
+    ap_buf reply;
+    bool ok = client_rpc(rt, AGENT_MSG_CONFIG, &body, AGENT_MSG_CONFIG,
+                         &reply, err, errlen);
+    ap_buf_free(&body);
+    if (!ok) return false;
+
+    ap_reader r;
+    ap_reader_init(&r, reply.data, reply.len);
+    ap_map mp;
+    bool decoded = client_decode_reply_map(&r, &mp, err, errlen);
+    if (!decoded) { ap_buf_free(&reply); return false; }
+
+    /* mp borrows pointers into reply.data -- every field read must happen
+     * before it is freed. */
+    bool server_ok = ap_map_get_bool(&mp, "ok", false);
+    char e[192] = {0};
+    if (!server_ok) ap_map_get_str(&mp, "error", e, sizeof(e));
+    if (value_out) *value_out = ap_map_get_u32(&mp, "value", 0);
+    ap_buf_free(&reply);
+
+    if (!server_ok) {
+        snprintf(err, errlen, "%s", e[0] ? e : "request rejected");
+        return false;
+    }
+    return true;
+}
+
+static bool client_power_set(client_runtime *rt, int power, char *err, size_t errlen) {
+    return client_config_rpc(rt, AGENT_CONFIG_POWER, AGENT_CONFIG_SET,
+                             (uint32_t)power, false, NULL, err, errlen);
+}
+
+static bool client_steer_get(client_runtime *rt, float *scale, char *err, size_t errlen) {
+    uint32_t v = 0;
+    if (!client_config_rpc(rt, AGENT_CONFIG_STEER, AGENT_CONFIG_GET, 0, false,
+                           &v, err, errlen))
+        return false;
+    *scale = (float)ap_milli_to_double(v);
+    return true;
+}
+
+static bool client_steer_set(client_runtime *rt, float scale, char *err, size_t errlen) {
+    return client_config_rpc(rt, AGENT_CONFIG_STEER, AGENT_CONFIG_SET,
+                             ap_milli_from_double(scale), false, NULL, err, errlen);
+}
+
+static bool client_hints_set(client_runtime *rt, bool enabled, char *err, size_t errlen) {
+    return client_config_rpc(rt, AGENT_CONFIG_HINTS, AGENT_CONFIG_SET,
+                             0, enabled, NULL, err, errlen);
+}
+
+/* -- SESSION RPCs ------------------------------------------------------ */
+
+static bool client_session_save(client_runtime *rt, bool *scheduled_out,
+                                char *err, size_t errlen) {
+    ap_buf body;
+    ap_buf_init(&body);
+    ap_encode_session_simple(&body, AGENT_SESSION_SAVE);
+    ap_buf reply;
+    bool ok = client_rpc(rt, AGENT_MSG_SESSION, &body, AGENT_MSG_SESSION,
+                         &reply, err, errlen);
+    ap_buf_free(&body);
+    if (!ok) return false;
+
+    ap_reader r;
+    ap_reader_init(&r, reply.data, reply.len);
+    ap_map mp;
+    bool decoded = client_decode_reply_map(&r, &mp, err, errlen);
+    if (!decoded) { ap_buf_free(&reply); return false; }
+
+    /* mp borrows pointers into reply.data -- every field read must happen
+     * before it is freed. */
+    bool server_ok = ap_map_get_bool(&mp, "ok", false);
+    bool scheduled = ap_map_get_bool(&mp, "scheduled", false);
+    char e[192] = {0};
+    if (!server_ok) ap_map_get_str(&mp, "error", e, sizeof(e));
+    /* A scheduled save runs later at the worker's next safe point; the
+     * client has nothing new to remember about the session identity yet. */
+    if (server_ok && !scheduled)
+        ap_map_get_str(&mp, "sha", rt->current_sha, sizeof(rt->current_sha));
+    ap_buf_free(&reply);
+
+    if (scheduled_out) *scheduled_out = scheduled;
+    if (!server_ok) {
+        snprintf(err, errlen, "%s", e[0] ? e : "save failed");
+        return false;
+    }
+    if (!scheduled) rt->activity_since_save = false;
+    return true;
+}
+
+/* Shared SESSION switch RPC. Does not touch rt's session-identity mirror --
+ * callers decide whether the switch actually changed the live session
+ * (client_session_switch) or was just a self-referencing history dump
+ * (client_session_show_history, which must not clear activity_since_save). */
+static bool client_session_switch_raw(client_runtime *rt, const char *sha_prefix,
+                                      uint32_t history_turns,
+                                      char *sha_out, size_t sha_cap,
+                                      char *title_out, size_t title_cap,
+                                      char *err, size_t errlen) {
+    ap_session_switch_args a = {0};
+    snprintf(a.sha_prefix, sizeof(a.sha_prefix), "%s", sha_prefix);
+    a.history_turns = history_turns;
+    ap_buf body;
+    ap_buf_init(&body);
+    ap_encode_session_switch(&body, &a);
+    ap_buf reply;
+    bool ok = client_rpc(rt, AGENT_MSG_SESSION, &body, AGENT_MSG_SESSION,
+                         &reply, err, errlen);
+    ap_buf_free(&body);
+    if (!ok) return false;
+
+    ap_reader r;
+    ap_reader_init(&r, reply.data, reply.len);
+    ap_map mp;
+    bool decoded = client_decode_reply_map(&r, &mp, err, errlen);
+    if (!decoded) { ap_buf_free(&reply); return false; }
+
+    /* mp borrows pointers into reply.data -- every field read must happen
+     * before it is freed. */
+    bool server_ok = ap_map_get_bool(&mp, "ok", false);
+    char e[192] = {0};
+    if (!server_ok) {
+        ap_map_get_str(&mp, "error", e, sizeof(e));
+    } else {
+        if (sha_out) ap_map_get_str(&mp, "sha", sha_out, sha_cap);
+        if (title_out) ap_map_get_str(&mp, "title", title_out, title_cap);
+    }
+    ap_buf_free(&reply);
+
+    if (!server_ok) {
+        snprintf(err, errlen, "%s", e[0] ? e : "switch failed");
+        return false;
+    }
+    return true;
+}
+
+static bool client_session_switch(client_runtime *rt, const char *sha_prefix,
+                                  uint32_t history_turns, char *err, size_t errlen) {
+    if (!client_session_switch_raw(rt, sha_prefix, history_turns,
+                                   rt->current_sha, sizeof(rt->current_sha),
+                                   rt->current_title, sizeof(rt->current_title),
+                                   err, errlen))
+        return false;
+    rt->activity_since_save = false;
+    return true;
+}
+
+/* /history N: re-dump the current session's own history (§ plan "switch on
+ * the current sha covers history"). Only possible once the session has an
+ * identity, i.e. after at least one save. */
+static bool client_session_show_history(client_runtime *rt, uint32_t turns,
+                                        char *err, size_t errlen) {
+    if (!rt->current_sha[0]) {
+        snprintf(err, errlen, "no history yet -- /save first");
+        return false;
+    }
+    return client_session_switch_raw(rt, rt->current_sha, turns,
+                                     NULL, 0, NULL, 0, err, errlen);
+}
+
+static bool client_session_del(client_runtime *rt, const char *sha_prefix, bool strip,
+                               char *sha_out, size_t sha_cap, uint32_t *tokens_out,
+                               char *err, size_t errlen) {
+    ap_session_del_args a = {0};
+    snprintf(a.sha_prefix, sizeof(a.sha_prefix), "%s", sha_prefix);
+    a.strip = strip;
+    ap_buf body;
+    ap_buf_init(&body);
+    ap_encode_session_del(&body, &a);
+    ap_buf reply;
+    bool ok = client_rpc(rt, AGENT_MSG_SESSION, &body, AGENT_MSG_SESSION,
+                         &reply, err, errlen);
+    ap_buf_free(&body);
+    if (!ok) return false;
+
+    ap_reader r;
+    ap_reader_init(&r, reply.data, reply.len);
+    ap_map mp;
+    bool decoded = client_decode_reply_map(&r, &mp, err, errlen);
+    if (!decoded) { ap_buf_free(&reply); return false; }
+
+    /* mp borrows pointers into reply.data -- every field read must happen
+     * before it is freed. */
+    bool server_ok = ap_map_get_bool(&mp, "ok", false);
+    char e[192] = {0};
+    if (!server_ok) {
+        ap_map_get_str(&mp, "error", e, sizeof(e));
+    } else {
+        if (sha_out) ap_map_get_str(&mp, "sha", sha_out, sha_cap);
+        if (tokens_out) *tokens_out = ap_map_get_u32(&mp, "tokens", 0);
+    }
+    ap_buf_free(&reply);
+
+    if (!server_ok) {
+        snprintf(err, errlen, "%s", e[0] ? e : (strip ? "strip failed" : "delete failed"));
+        return false;
+    }
+    return true;
+}
+
+/* Mid-session /new: same wire subcommand the handshake uses to open a fresh
+ * session, replied with a full ap_session_ready rather than the generic
+ * MAP shape. Resets the client's session-identity mirror -- a fresh session
+ * has no sha until it is saved. */
+static bool client_session_new(client_runtime *rt, const client_config *cfg,
+                               char *err, size_t errlen) {
+    ap_session_new_args a;
+    client_fill_session_new(cfg, &a);
+    ap_buf body;
+    ap_buf_init(&body);
+    ap_encode_session_new(&body, &a);
+    ap_buf reply;
+    bool ok = client_rpc(rt, AGENT_MSG_SESSION, &body, AGENT_MSG_SESSION,
+                         &reply, err, errlen);
+    ap_buf_free(&body);
+    if (!ok) return false;
+
+    ap_reader r;
+    ap_reader_init(&r, reply.data, reply.len);
+    ap_session_ready ready;
+    bool decoded = ap_decode_session_ready(&r, &ready, err, errlen);
+    ap_buf_free(&reply);
+    if (!decoded) return false;
+
+    rt->current_sha[0] = '\0';
+    rt->current_title[0] = '\0';
+    rt->activity_since_save = false;
+    rt->have_status = true;
+    rt->last_status.state = ready.state;
+    rt->last_status.ctx_used = ready.ctx_used;
+    rt->last_status.ctx_size = ready.ctx_size;
+    rt->last_status.error[0] = '\0';
+    return true;
+}
+
+/* -- /switch tab completion, filtered from the session-list cache (Risk 15) */
+
+static client_runtime *g_completion_runtime;
+
+static void client_switch_completion_callback(const char *buf,
+                                              linenoiseCompletions *lc) {
+    client_runtime *rt = g_completion_runtime;
+    static const char cmdname[] = "/switch";
+    const size_t cmd_len = sizeof(cmdname) - 1;
+    if (!rt || !buf || strncmp(buf, cmdname, cmd_len) != 0) return;
+
+    const char *p = buf + cmd_len;
+    if (*p && *p != ' ' && *p != '\t') return;
+    while (*p == ' ' || *p == '\t') p++;
+
+    const char *prefix = p;
+    size_t prefix_len = strlen(prefix);
+    for (size_t i = 0; i < prefix_len; i++) {
+        if (!isxdigit((unsigned char)prefix[i])) return;
+    }
+    if (prefix_len > 40) return;
+
+    /* rt->sessions arrives pre-sorted by recency: the server sorts before
+     * replying to SESSION list, so no local re-sort is needed here. */
+    for (size_t i = 0; i < rt->sessions.len; i++) {
+        const client_session_row *row = &rt->sessions.v[i];
+        if (prefix_len && strncasecmp(row->sha, prefix, prefix_len) != 0) continue;
+        char line[64];
+        int sha_chars = prefix_len > 8 ? 40 : 8;
+        snprintf(line, sizeof(line), "/switch %.*s", sha_chars, row->sha);
+        linenoiseAddCompletion(lc, line);
+    }
+}
+
+/* -- save prompts, reworked against the client's activity mirror ---------- */
+
+static bool client_maybe_save_before_leaving_session(client_runtime *rt) {
+    if (!rt->activity_since_save) return true;
+    if (!agent_prompt_yes_no("Save current session? (y/n) ")) return true;
+    char err[192] = {0};
+    bool scheduled = false;
+    if (client_session_save(rt, &scheduled, err, sizeof(err))) return true;
+    printf("save failed: %s\n", err);
+    return agent_prompt_yes_no("Continue anyway? (y/n) ");
+}
+
+/* Process exit is different from /new or /switch: once the terminal is
+ * already restored, declining the save can terminate immediately instead of
+ * waiting for orderly teardown -- mirrors ds4_agent.c's distinction. */
+static agent_exit_save_result client_maybe_save_before_exiting(client_runtime *rt) {
+    if (!rt->activity_since_save) return AGENT_EXIT_CLEAN;
+    if (!agent_prompt_yes_no("Save current session? (y/n) ")) return AGENT_EXIT_NOW;
+    char err[192] = {0};
+    bool scheduled = false;
+    if (client_session_save(rt, &scheduled, err, sizeof(err))) return AGENT_EXIT_CLEAN;
+    printf("save failed: %s\n", err);
+    return agent_prompt_yes_no("Continue anyway? (y/n) ") ?
+        AGENT_EXIT_NOW : AGENT_EXIT_CANCEL;
+}
+
+/* -- /list: render the freshly refreshed session cache --------------------
+ * Mirrors ds4_agent.c's agent_worker_list_sessions, minus the on-disk file
+ * size / stripped-KV annotation (not carried by the SESSION list wire
+ * reply); /switch and /del by prefix are unaffected. */
+static void client_print_session_list(client_runtime *rt) {
+    char err[192] = {0};
+    if (!client_refresh_session_list(rt, err, sizeof(err))) {
+        printf("list failed: %s\n", err);
+        return;
+    }
+    if (!rt->sessions.len) {
+        printf("no saved sessions\n");
+        return;
+    }
+
+    bool color = isatty(STDOUT_FILENO) != 0;
+    const char *sha_on = color ? "\x1b[1;96m" : "";
+    const char *title_on = color ? "\x1b[1;97m" : "";
+    const char *help_on = color ? "\x1b[97m" : "";
+    const char *dim = color ? "\x1b[90m" : "";
+    const char *reset = color ? "\x1b[0m" : "";
+
+    for (size_t i = 0; i < rt->sessions.len; i++) {
+        const client_session_row *row = &rt->sessions.v[i];
+        char age[32];
+        agent_format_age((uint64_t)(row->last_used ? row->last_used : row->created_at),
+                         age, sizeof(age));
+        printf("%s%.8s%s %s>%s %s%s%s%s\n",
+               sha_on, row->sha, reset, dim, reset,
+               title_on, row->title, reset,
+               row->is_current ? " (current)" : "");
+        printf("         %s> %s, %u tokens%s\n\n",
+               dim, age, row->tokens, reset);
+    }
+    printf("%sUse /switch <id> to select a session, /del <id> to remove, "
+           "/strip <id> to strip KV cache.%s\n",
+           help_on, reset);
+}
 
 /* ========================================================================= */
 /* main                                                                       */
