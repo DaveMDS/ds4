@@ -207,17 +207,18 @@ help:
 	@echo "  make rocm                Alias for make strix-halo"
 	@echo "  make test-mxfp4-rocm     Build and run the synthetic ROCm MXFP4 MoE test"
 	@echo "  make test-rocm           Core regression suite on ROCm-only hosts"
-	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
+	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, ./ds4-agent, ./ds4-agent-server, and ./ds4-agent-client"
+	@echo "  make test-cpu            Build and run the ds4-agent-server/-client protocol test suite (no GPU, no model)"
 	@echo "  make test                Build and run tests"
 	@echo "  make dspark-verify-depth Run DSpark speculative verification smoke if support GGUF is present"
 	@echo "  make mtp-verify-depth    Run legacy MTP speculative verification smoke if MTP GGUF is present"
 	@echo "  make clean               Remove build outputs"
 
 cuda-spark:
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=sm_121
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-agent-server ds4-agent-client CUDA_ARCH=sm_121
 
 cuda-generic:
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=native
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-agent-server ds4-agent-client CUDA_ARCH=native
 
 cuda:
 	@if [ -z "$(strip $(CUDA_ARCH))" ]; then \
@@ -225,10 +226,10 @@ cuda:
 		echo "       or use make cuda-spark / make cuda-generic"; \
 		exit 2; \
 	fi
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH="$(CUDA_ARCH)"
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-agent-server ds4-agent-client CUDA_ARCH="$(CUDA_ARCH)"
 
 strix-halo:
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-agent-server ds4-agent-client \
 		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o $(ROCM_MMQ_OBJS)" \
 		CFLAGS="$(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
@@ -244,7 +245,7 @@ test-rocm:
 	$(MAKE) -B ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
 		test-session-state \
 		tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args tests/test_prompt_prefix \
-		ds4 ds4-server ds4-bench ds4-agent \
+		ds4 ds4-server ds4-bench ds4-agent ds4-agent-server ds4-agent-client \
 		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o $(ROCM_MMQ_OBJS)" \
 		CFLAGS="$(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
@@ -384,7 +385,7 @@ ds4_agent_server.o: ds4_agent_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.
 ds4_agent_server_cpu.o: ds4_agent_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_help.h ds4_gpu_args.h ds4_kvstore.h ds4_prompt_prefix.h ds4_tool_text.h ds4_agent_proto.h ds4_agent_utils.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -Wno-unused-function -c -o $@ ds4_agent_server.c
 
-ds4_agent_client.o: ds4_agent_client.c ds4.h ds4_help.h ds4_agent_proto.h ds4_agent_utils.h
+ds4_agent_client.o: ds4_agent_client.c ds4.h ds4_help.h ds4_web.h linenoise.h ds4_agent_proto.h ds4_agent_utils.h
 	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ ds4_agent_client.c
 
 ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
@@ -734,10 +735,10 @@ ds4_agent_proto_test: tests/ds4_agent_proto_test.c ds4_agent_proto.o ds4_agent_u
 
 # Always CPU: the server test exercises only pure/control paths, never the
 # engine-dependent sampling/prefill/sync (the monolith's own boundary).
-ds4_agent_server_test: tests/ds4_agent_server_test.c ds4_agent_server.c ds4_agent_proto.o ds4_agent_utils.o ds4_help.o ds4_prompt_prefix.o ds4_kvstore.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) ds4_agent_proto.h ds4_agent_utils.h ds4.h
+ds4_agent_server_test: tests/ds4_agent_server_test.c ds4_agent_server.c ds4_agent_proto.o ds4_agent_utils.o ds4_help.o ds4_prompt_prefix.o ds4_kvstore.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_help.h ds4_gpu_args.h ds4_kvstore.h ds4_prompt_prefix.h ds4_tool_text.h ds4_agent_proto.h ds4_agent_utils.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -I. -o $@ tests/ds4_agent_server_test.c ds4_agent_proto.o ds4_agent_utils.o ds4_help.o ds4_prompt_prefix.o ds4_kvstore.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 
-ds4_agent_client_test: tests/ds4_agent_client_test.c ds4_agent_client.c ds4_agent_proto.o ds4_agent_utils.o ds4_help.o ds4_web.o linenoise.o ds4_agent_proto.h ds4_agent_utils.h ds4.h
+ds4_agent_client_test: tests/ds4_agent_client_test.c ds4_agent_client.c ds4_agent_proto.o ds4_agent_utils.o ds4_help.o ds4_web.o linenoise.o ds4.h ds4_help.h ds4_web.h linenoise.h ds4_agent_proto.h ds4_agent_utils.h
 	$(CC) $(CFLAGS) -Wno-unused-function -I. -o $@ tests/ds4_agent_client_test.c ds4_agent_proto.o ds4_agent_utils.o ds4_help.o ds4_web.o linenoise.o $(LDLIBS)
 
 .PHONY: test-cpu
@@ -753,7 +754,8 @@ test-frontends: ds4_test ds4_agent_test
 
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-state test-linux-memory \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
-	tests/test_deepseek4_vision_image tests/test_prompt_prefix $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
+	tests/test_deepseek4_vision_image tests/test_prompt_prefix $(SAMPLING_TEST) \
+	ds4 ds4-server ds4-bench ds4-agent ds4-agent-server ds4-agent-client
 	./ds4-eval --validate-cases
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
