@@ -157,6 +157,31 @@ be saved. Saved conversations and traces may contain private information.
 For Pi, OpenCode, Codex CLI, or Claude Code, use `ds4-server` instead and follow
 the [client setup guide](docs/CLIENTS.md).
 
+#### Running the agent split across two machines
+
+`ds4-agent` is one process holding the model, the terminal, and tool
+execution together. `ds4-agent-server` and `ds4-agent-client` are the same
+agent split in two: the server owns the model and runs headless, the client
+owns the terminal and every tool call (read/edit/bash/web/...), talking to
+the server over a small TCP protocol:
+
+```sh
+./ds4-agent-server -m ds4flash.gguf --ctx 32768   # on the GPU machine
+./ds4-agent-client                                # anywhere, --help for --server/--think/...
+```
+
+This is for running the agent from a laptop against a model that lives on a
+bigger machine, without exposing an HTTP server. The wire protocol has no
+authentication: reach a remote `ds4-agent-server` only over an SSH tunnel or
+a trusted VPN, for example `ssh -N -L 7878:127.0.0.1:7878 HOST` then
+`ds4-agent-client --server 127.0.0.1:7878`. `--host 0.0.0.0` on the server is
+possible but exposes the model and the on-disk KV store to the network.
+`ds4-agent-server` takes the same instance lock as any other engine-owning
+binary, so it cannot share a host with a running `ds4-agent` or `ds4-server`.
+If the client disconnects mid-turn, the server parks the session;
+reconnecting resumes it automatically at its current state. Run either
+binary with `--help` for the full option list.
+
 ### Models, images, and speculation
 
 [Models and vision](docs/MODELS.md) lists the supported downloads and memory

@@ -35,6 +35,15 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
 - `ds4_cli.c`: command line, linenoise REPL, interactive transcript handling.
 - `ds4_server.c`: OpenAI/Anthropic compatible HTTP API, worker queue, streaming,
   tool-call mapping, disk KV cache policy.
+- `ds4_agent.c`: the single-process coding agent (`ds4-agent`) -- model, terminal,
+  and tool execution together.
+- `ds4_agent_server.c` / `ds4_agent_client.c`: the same agent split across a
+  process boundary (`ds4-agent-server` owns the model and runs headless;
+  `ds4-agent-client` owns the terminal and every tool call), connected by the
+  framed TCP protocol in `ds4_agent_proto.[ch]`. `ds4_agent_utils.[ch]` holds
+  the pure helpers both binaries link. Plaintext, no authentication -- SSH
+  tunnel or trusted VPN only; see the "Agent Server/Client Options" sections
+  of `ds4-agent-server --help` / `ds4-agent-client --help`.
 - `ds4_metal.m`: Objective-C Metal runtime and kernel wrappers.
 - `metal/*.metal`: compute kernels.
 - `tests/`: unit and live integration tests.

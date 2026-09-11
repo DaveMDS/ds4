@@ -1334,6 +1334,60 @@ The agent is the most stateful component.  Test it manually, not only by build.
   status bar fill to terminal width, syntax highlighting in Markdown/code blocks,
   and SSH/remote terminal flicker.
 
+### Split agent (ds4-agent-server / ds4-agent-client)
+
+`ds4-agent-server` and `ds4-agent-client` are the same agent as `ds4-agent`
+split across a TCP connection: the server owns the model and every tool call
+runs on the client. Tool behavior, compaction quality, and generation
+correctness are already covered by the `ds4-agent` matrix above and do not
+need a second full pass per binary. This section covers what is new: the
+wire protocol, reconnect, disconnect, and the network security model. Run it
+on the Strix Halo ROCm host (section 9) for a real-inference pass, and
+`make cpu` elsewhere as a compile-only smoke.
+
+- Build: `make clean && make strix-halo` must produce `ds4-agent-server` and
+  `ds4-agent-client` alongside the other binaries, warning-free.
+- Loopback session: start `./ds4-agent-server -m MODEL.gguf --ctx 32768`,
+  connect with `./ds4-agent-client`, and run a turn that uses at least one
+  tool (read/edit/bash). Confirm the streamed text, the tool call
+  visualization, and the tool result all render exactly as they do in
+  `ds4-agent`.
+- `/save`, `/list`, `/switch`, `/del`, `/strip`, `/history`, `/compact`,
+  `/power`, `/hints`, `/steer`, and `/new`: exercise each once and confirm
+  the reply matches `ds4-agent`'s behavior. `/switch` tab completion must
+  offer sessions from the server's `~/.ds4/kvcache`, not a local directory
+  on the client machine.
+- Force compaction (small `--ctx`, a long conversation, or `/compact`) while
+  a background `bash` job is still running. The post-compaction turn must
+  still carry the live-jobs reminder the way `ds4-agent` does.
+- `view_image` on a real file: confirm the client reads and sends the raw
+  bytes, and the server-side vision encoding produces a correct answer,
+  with a vision-capable model.
+- Interrupt (Ctrl+C) at each of: mid-PREFILL, mid-GENERATING, waiting on a
+  TOOL_CALLS round trip, mid-COMPACTING, and with a message queued while
+  busy. Every case must return the client to an idle, usable prompt without
+  a stuck connection or a queued message being silently dropped.
+- Reconnect: start a turn, kill `ds4-agent-client` (not the server) mid-turn,
+  relaunch it. The HELLO reply must report the parked session, `SESSION
+  resume` must succeed, and the session must be intact and idle -- the
+  in-flight turn is lost, but history and KV state are not.
+- Disconnect the other way: kill `ds4-agent-server` while a client is
+  attached. The client must report the disconnect and exit (or return to a
+  clean prompt in a later interactive rework) rather than hang.
+- Instance lock: with `ds4-agent-server` running against a model, start a
+  second `ds4-agent-server` (or `ds4-agent`/`ds4-server`) against the same
+  lock file. It must fail to acquire the engine and exit cleanly, the same
+  as any two engine-owning binaries today.
+- Security model: confirm `ds4-agent-server --help` and `ds4-agent-client
+  --help` still print the plaintext/no-authentication warning. Start a
+  server with `--host 0.0.0.0` and confirm it is reachable from a second
+  machine on the LAN -- this is the dangerous case the warning describes,
+  not something to leave running after the check. Then do the sanctioned
+  setup for real: tunnel with `ssh -N -L 7878:127.0.0.1:7878 HOST` from a
+  genuinely separate machine and connect with `ds4-agent-client --server
+  127.0.0.1:7878`, confirming the tunnel path itself (not just loopback)
+  carries a full turn correctly.
+
 September 8 focused regression pass on M5 Max IT, using GLM 5.3 Flash Q2 and
 DeepSeek Flash Vision Exp mixed Q2/Q4 with their vision encoders:
 
