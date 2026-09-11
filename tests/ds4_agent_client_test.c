@@ -426,6 +426,317 @@ static void test_build_status_text(void) {
     CHECK(strstr(buf, "50/200") != NULL && strstr(buf, "25.0%") != NULL);
 }
 
+/* ---- T10: client tool execution ---------------------------------------- */
+
+#include <stdarg.h>
+#include <sys/wait.h>
+
+static char *test_tmpdir(void) {
+    static char dir[] = "/tmp/ds4agentclitestXXXXXX";
+    char *d = xstrdup(dir);
+    CHECK(mkdtemp(d) != NULL);
+    return d;
+}
+
+static void write_file(const char *path, const char *content) {
+    FILE *fp = fopen(path, "wb");
+    CHECK(fp != NULL);
+    if (fp) {
+        fwrite(content, 1, strlen(content), fp);
+        fclose(fp);
+    }
+}
+
+static ap_tool_call mk_call(const char *name, int nargs, ...) {
+    ap_tool_call c;
+    memset(&c, 0, sizeof(c));
+    c.name = name;
+    c.name_len = strlen(name);
+    va_list ap;
+    va_start(ap, nargs);
+    for (int i = 0; i < nargs; i++) {
+        const char *an = va_arg(ap, const char *);
+        const char *av = va_arg(ap, const char *);
+        c.args[i].name = an;
+        c.args[i].name_len = strlen(an);
+        c.args[i].value = av;
+        c.args[i].value_len = strlen(av);
+        c.args[i].is_string = true;
+    }
+    va_end(ap);
+    c.arg_count = (uint32_t)nargs;
+    return c;
+}
+
+static const char *result_text(const client_tool_result *r) {
+    return r->part_count ? r->parts[0] : "";
+}
+
+static void test_tool_write_read_edit(void) {
+    char *dir = test_tmpdir();
+    char path[600];
+    snprintf(path, sizeof(path), "%s/a.c", dir);
+
+    agent_worker w;
+    client_worker_init(&w, 100000);
+
+    ap_tool_calls calls = {0};
+    calls.request_id = 1;
+    calls.calls[0] = mk_call("write", 2, "path", path, "content", "int x = 1;\n");
+    calls.call_count = 1;
+    client_tool_result r;
+    client_execute_tool_calls(&w, &calls, &r);
+    CHECK(strstr(result_text(&r), "Wrote") != NULL);
+    client_tool_result_free(&r);
+
+    calls.calls[0] = mk_call("read", 1, "path", path);
+    client_execute_tool_calls(&w, &calls, &r);
+    CHECK(strstr(result_text(&r), "int x = 1;") != NULL);
+    client_tool_result_free(&r);
+
+    calls.calls[0] = mk_call("edit", 3, "path", path, "old", "int x = 1;\n",
+                             "new", "int x = 2;\n");
+    client_execute_tool_calls(&w, &calls, &r);
+    CHECK(strstr(result_text(&r), "Edited") != NULL);
+    client_tool_result_free(&r);
+
+    char *data = NULL;
+    size_t len = 0;
+    CHECK(agent_read_file_bytes(path, &data, &len, (char[64]){0}, 64) == 0);
+    CHECK(strstr(data, "int x = 2;") != NULL);
+    free(data);
+
+    client_worker_free(&w);
+    free(dir);
+}
+
+static void test_tool_edit_not_unique(void) {
+    char *dir = test_tmpdir();
+    char path[600];
+    snprintf(path, sizeof(path), "%s/dup.c", dir);
+    write_file(path, "foo\nfoo\n");
+
+    agent_worker w;
+    client_worker_init(&w, 100000);
+    ap_tool_calls calls = {0};
+    calls.request_id = 1;
+    calls.calls[0] = mk_call("edit", 3, "path", path, "old", "foo\n", "new", "bar\n");
+    calls.call_count = 1;
+    client_tool_result r;
+    client_execute_tool_calls(&w, &calls, &r);
+    CHECK(strstr(result_text(&r), "Tool error") != NULL);
+    CHECK(strstr(result_text(&r), "not unique") != NULL);
+    client_tool_result_free(&r);
+    client_worker_free(&w);
+    free(dir);
+}
+
+static void test_tool_list_and_search(void) {
+    char *dir = test_tmpdir();
+    char f1[600], f2[600];
+    snprintf(f1, sizeof(f1), "%s/one.txt", dir);
+    snprintf(f2, sizeof(f2), "%s/two.txt", dir);
+    write_file(f1, "needle here\n");
+    write_file(f2, "nothing\n");
+
+    agent_worker w;
+    client_worker_init(&w, 100000);
+
+    ap_tool_calls calls = {0};
+    calls.request_id = 1;
+    calls.calls[0] = mk_call("list", 1, "path", dir);
+    calls.call_count = 1;
+    client_tool_result r;
+    client_execute_tool_calls(&w, &calls, &r);
+    CHECK(strstr(result_text(&r), "one.txt") != NULL);
+    CHECK(strstr(result_text(&r), "two.txt") != NULL);
+    client_tool_result_free(&r);
+
+    calls.calls[0] = mk_call("search", 2, "query", "needle", "path", dir);
+    client_execute_tool_calls(&w, &calls, &r);
+    CHECK(strstr(result_text(&r), "one.txt") != NULL);
+    CHECK(strstr(result_text(&r), "needle here") != NULL);
+    CHECK(strstr(result_text(&r), "two.txt") == NULL);
+    client_tool_result_free(&r);
+
+    client_worker_free(&w);
+    free(dir);
+}
+
+static void test_tool_bash_lifecycle(void) {
+    agent_worker w;
+    client_worker_init(&w, 100000);
+
+    ap_tool_calls calls = {0};
+    calls.request_id = 1;
+    calls.calls[0] = mk_call("bash", 2, "command", "printf hi", "refresh_sec", "5");
+    calls.call_count = 1;
+    client_tool_result r;
+    client_execute_tool_calls(&w, &calls, &r);
+    CHECK(strstr(result_text(&r), "status=done") != NULL);
+    CHECK(strstr(result_text(&r), "exit_status=0") != NULL);
+    CHECK(strstr(result_text(&r), "hi") != NULL);
+    client_tool_result_free(&r);
+    CHECK(w.bash_jobs == NULL); /* removed once observed done */
+
+    /* a longer job with a short refresh: bash returns before it finishes */
+    calls.calls[0] = mk_call("bash", 2, "command", "sleep 3", "refresh_sec", "1");
+    client_execute_tool_calls(&w, &calls, &r);
+    client_tool_result_free(&r);
+    CHECK(w.bash_jobs != NULL);
+    int job_id = w.bash_jobs->id;
+    char job_str[16];
+    snprintf(job_str, sizeof(job_str), "%d", job_id);
+    calls.calls[0] = mk_call("bash_status", 1, "job", job_str);
+    client_execute_tool_calls(&w, &calls, &r);
+    CHECK(strstr(result_text(&r), "status=running") != NULL);
+    client_tool_result_free(&r);
+
+    calls.calls[0] = mk_call("bash_stop", 1, "job", job_str);
+    client_execute_tool_calls(&w, &calls, &r);
+    CHECK(strstr(result_text(&r), "status=done") != NULL);
+    client_tool_result_free(&r);
+    CHECK(w.bash_jobs == NULL);
+
+    client_worker_free(&w);
+}
+
+static void test_tool_view_image(void) {
+    char *dir = test_tmpdir();
+    char path[600];
+    snprintf(path, sizeof(path), "%s/pic.bin", dir);
+    write_file(path, "\x89PNGfakebytes");
+
+    agent_worker w;
+    client_worker_init(&w, 100000);
+    ap_tool_calls calls = {0};
+    calls.request_id = 7;
+    calls.calls[0] = mk_call("view_image", 1, "path", path);
+    calls.call_count = 1;
+    client_tool_result r;
+    client_execute_tool_calls(&w, &calls, &r);
+    CHECK(r.image_count == 1);
+    CHECK(r.images[0].len == strlen("\x89PNGfakebytes"));
+    CHECK(memcmp(r.images[0].bytes, "\x89PNGfakebytes", r.images[0].len) == 0);
+    CHECK(strstr(result_text(&r), "[tool:view_image]") == NULL); /* went to render sink, not the result */
+    client_tool_result_free(&r);
+    client_worker_free(&w);
+    free(dir);
+}
+
+static void test_fit_context_bucket_on_ctx_size(void) {
+    char *dir = test_tmpdir();
+    char path[600];
+    snprintf(path, sizeof(path), "%s/big.txt", dir);
+    agent_buf b = {0};
+    for (int i = 0; i < 400; i++) agent_buf_puts(&b, "line of text\n");
+    write_file(path, b.ptr);
+    free(b.ptr);
+
+    agent_worker w;
+    client_worker_init(&w, 4000); /* small ctx -> default 120 lines per read */
+    ap_tool_calls calls = {0};
+    calls.request_id = 1;
+    calls.calls[0] = mk_call("read", 1, "path", path);
+    calls.call_count = 1;
+    client_tool_result r;
+    client_execute_tool_calls(&w, &calls, &r);
+    CHECK(strstr(result_text(&r), "[Read truncated") != NULL);
+    CHECK(w.more_valid == true); /* more picks up where this chunk left off */
+    client_tool_result_free(&r);
+
+    calls.calls[0] = mk_call("more", 0);
+    client_execute_tool_calls(&w, &calls, &r);
+    CHECK(strstr(result_text(&r), "line of text") != NULL);
+    client_tool_result_free(&r);
+
+    client_worker_free(&w);
+    free(dir);
+}
+
+static void test_drain_reply_bash_jobs_note(void) {
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+
+    agent_worker w;
+    client_worker_init(&w, 100000);
+    ap_tool_calls calls = {0};
+    calls.request_id = 1;
+    calls.calls[0] = mk_call("bash", 2, "command", "sleep 3", "refresh_sec", "1");
+    calls.call_count = 1;
+    client_tool_result r;
+    client_execute_tool_calls(&w, &calls, &r);
+    client_tool_result_free(&r);
+    CHECK(w.bash_jobs != NULL);
+
+    client_conn co;
+    conn_init(&co, sv[0], NULL);
+    client_handle_drain_request(&co, &w, "continue the task");
+
+    ap_buf rx; ap_buf_init(&rx);
+    mock_drain(sv[1], &rx);
+    uint32_t type = 0;
+    ap_buf payload; ap_buf_init(&payload);
+    char ferr[128] = {0};
+    CHECK(ap_read_frame(&rx, &type, &payload, ferr, sizeof(ferr)) == AP_FRAME_OK);
+    CHECK(type == AGENT_MSG_DRAIN_REPLY);
+    ap_reader rd; ap_reader_init(&rd, payload.data, payload.len);
+    ap_drain_reply d;
+    CHECK(ap_decode_drain_reply(&rd, &d));
+    CHECK(memmem(d.text, d.text_len, "Bash job update after context compaction",
+                strlen("Bash job update after context compaction")) != NULL);
+    CHECK(memmem(d.text, d.text_len, "continue the task",
+                strlen("continue the task")) != NULL);
+
+    ap_buf_free(&payload);
+    ap_buf_free(&rx);
+    conn_free(&co);
+    close(sv[1]);
+    client_worker_free(&w);
+}
+
+static void test_tool_calls_over_wire(void) {
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    char *dir = test_tmpdir();
+    char path[600];
+    snprintf(path, sizeof(path), "%s/w.txt", dir);
+    write_file(path, "hello\n");
+
+    agent_worker w;
+    client_worker_init(&w, 100000);
+
+    ap_tool_calls calls = {0};
+    calls.request_id = 42;
+    calls.calls[0] = mk_call("read", 1, "path", path);
+    calls.call_count = 1;
+
+    client_conn co;
+    conn_init(&co, sv[0], NULL);
+    client_handle_tool_calls(&co, &w, &calls);
+
+    ap_buf rx; ap_buf_init(&rx);
+    mock_drain(sv[1], &rx);
+    uint32_t type = 0;
+    ap_buf payload; ap_buf_init(&payload);
+    char ferr[128] = {0};
+    CHECK(ap_read_frame(&rx, &type, &payload, ferr, sizeof(ferr)) == AP_FRAME_OK);
+    CHECK(type == AGENT_MSG_TOOL_RESULT);
+    ap_reader rd; ap_reader_init(&rd, payload.data, payload.len);
+    ap_tool_result tr;
+    CHECK(ap_decode_tool_result(&rd, &tr));
+    CHECK(tr.request_id == 42);
+    CHECK(tr.text_part_count >= 1);
+    CHECK(memmem(tr.text_parts[0].ptr, tr.text_parts[0].len, "hello", 5) != NULL);
+
+    ap_buf_free(&payload);
+    ap_buf_free(&rx);
+    conn_free(&co);
+    close(sv[1]);
+    client_worker_free(&w);
+    free(dir);
+}
+
 int main(void) {
     test_handshake_new_session();
     test_handshake_resume();
@@ -437,6 +748,14 @@ int main(void) {
     test_render_tool_read_viz();
     test_render_tool_edit_diff();
     test_build_status_text();
+    test_tool_write_read_edit();
+    test_tool_edit_not_unique();
+    test_tool_list_and_search();
+    test_tool_bash_lifecycle();
+    test_tool_view_image();
+    test_fit_context_bucket_on_ctx_size();
+    test_drain_reply_bash_jobs_note();
+    test_tool_calls_over_wire();
 
     if (failures) {
         fprintf(stderr, "%d agent client test(s) failed\n", failures);
