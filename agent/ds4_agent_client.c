@@ -1379,8 +1379,26 @@ static void editor_write_async(client_editor *ed, const char *text, size_t len,
     ed->active = true;
 }
 
+static void client_write_welcome_banner(client_editor *ed, int ctx_size,
+                                        const char *prompt, const char *statusline) {
+    char ctx[32], banner[256];
+    client_format_ctx_size(ctx_size, ctx, sizeof(ctx));
+    if (stdout_is_tty()) {
+        snprintf(banner, sizeof(banner),
+                 "\x1b[1;97mDwarf\x1b[1;94mStar\x1b[0m 🐋 Agent, context %s tokens\n\n",
+                 ctx);
+    } else {
+        snprintf(banner, sizeof(banner), "DwarfStar Agent, context %s tokens\n\n", ctx);
+    }
+    editor_write_async(ed, banner, strlen(banner), prompt, statusline, true);
+}
+
 static void editor_start(client_editor *ed, const char *prompt, const char *status) {
-    memset(ed, 0, sizeof(*ed));
+    /* Note: do not memset the whole struct.  On a reopen (after a submitted
+     * line) the scroll-region layout (term_rows/cols, output_bottom, prompt_row,
+     * reserved_rows) must be preserved so the prompt stays in its reserved
+     * bottom rows without tearing down / scrolling the region above.  Only the
+     * input and per-prompt state is reset here. */
     ed->input_buf_len = 4096;
     ed->input_buf = xmalloc(ed->input_buf_len);
     snprintf(ed->prompt, sizeof(ed->prompt), "%s", prompt);
@@ -1431,7 +1449,9 @@ static void editor_stop(client_editor *ed) {
     if (!ed->hidden && (isatty(ed->edit.ifd) || getenv("LINENOISE_ASSUME_TTY")))
         editor_hide(ed);
     linenoiseEditStop(&ed->edit);
-    editor_restore_terminal_layout(ed);
+    /* Keep the scroll-region layout live so a reopen (after a submitted line)
+     * does not tear down the region and leave a blank line in the output area.
+     * The caller restores the terminal layout once at shutdown. */
     free(ed->input_buf);
     ed->input_buf = NULL;
     ed->active = false;
@@ -1930,6 +1950,24 @@ static void client_request(agent_client *c, unsigned char tag, const char *arg) 
     pthread_mutex_unlock(&c->mu);
 }
 
+/* Echo a submitted user message into the chat output, matching the monolith's
+ * agent_echo_user_prompt formatting. */
+static void client_echo_user(agent_client *c, const char *text) {
+    agent_buf b = {0};
+    if (stdout_is_tty()) {
+        agent_buf_puts(&b, "\x1b[1;91m*\x1b[1;97m ");
+        agent_buf_puts(&b, text ? text : "");
+        agent_buf_puts(&b, "\x1b[0m\n\n");
+    } else {
+        agent_buf_puts(&b, "* ");
+        agent_buf_puts(&b, text ? text : "");
+        agent_buf_puts(&b, "\n\n");
+    }
+    char *msg = agent_buf_take(&b);
+    client_publish_puts(c, msg);
+    free(msg);
+}
+
 static void client_submit_user(agent_client *c, const char *text) {
     pthread_mutex_lock(&c->mu);
     free(c->pending_user);
@@ -2093,6 +2131,7 @@ static bool client_feed_editor(client_editor *ed, client_prompt_queue *queue,
         } else if (client_worker_idle(c)) {
             linenoiseHistoryAdd(cmd);
             client_submit_user(c, cmd);
+            client_echo_user(c, cmd);
         } else {
             /* Worker is busy: queue the prompt; drain when idle. */
             client_prompt_queue_push(queue, cmd);
@@ -2120,8 +2159,9 @@ static void client_run_interactive(agent_client *c) {
     char prompt[160], statusline[4096];
     client_build_prompt_text(&st, prompt, sizeof(prompt));
     client_build_footer_text(&st, NULL, statusline, sizeof(statusline));
-    client_editor editor;
+    client_editor editor = {0};
     editor_start(&editor, prompt, statusline);
+    client_write_welcome_banner(&editor, st.ctx_size, prompt, statusline);
 
     client_prompt_queue queue = {0};
     bool running = true;
@@ -2199,6 +2239,7 @@ static void client_run_interactive(agent_client *c) {
         }
     }
     editor_stop(&editor);
+    editor_restore_terminal_layout(&editor);
     client_prompt_queue_free(&queue);
     free(initial_pending);
 }
