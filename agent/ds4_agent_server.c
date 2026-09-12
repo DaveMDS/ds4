@@ -4385,28 +4385,11 @@ static bool worker_take_compact_requested(agent_worker *w) {
 
 static char *worker_request_queued_user_drain(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
-    w->queued_user_pending = true;
-    w->queued_user_answered = false;
-    free(w->queued_user_text);
-    w->queued_user_text = NULL;
-    pthread_cond_signal(&w->cond);
-    while (!w->stop && !w->queued_user_answered)
-        pthread_cond_wait(&w->cond, &w->mu);
     char *text = w->queued_user_text;
     w->queued_user_text = NULL;
-    w->queued_user_pending = false;
-    w->queued_user_answered = false;
     pthread_mutex_unlock(&w->mu);
+    dbg_log('T', "queued user drain -> %s", text && text[0] ? "present" : "none");
     return text;
-}
-
-static void worker_answer_queued_user_drain(agent_worker *w, char *text) {
-    pthread_mutex_lock(&w->mu);
-    free(w->queued_user_text);
-    w->queued_user_text = text;
-    w->queued_user_answered = true;
-    pthread_cond_signal(&w->cond);
-    pthread_mutex_unlock(&w->mu);
 }
 
 static char *worker_request_tool_result(agent_worker *w) {
@@ -4433,6 +4416,7 @@ static void worker_answer_tool_result(agent_worker *w, char *text) {
     w->tool_result_answered = true;
     pthread_cond_signal(&w->cond);
     pthread_mutex_unlock(&w->mu);
+    dbg_log('T', "TOOL_RESULT answered (len %zu)", text ? strlen(text) : 0);
 }
 
 /* ---- Tool execution over the wire ----
@@ -4456,6 +4440,7 @@ static agent_tool_observation worker_run_tool_calls(agent_worker *w,
     free(buf);
 
     char *text = worker_request_tool_result(w);
+    dbg_log('T', "worker woke, tool result text=%s", text && text[0] ? "present" : "NULL");
     if (!text && worker_should_interrupt(w)) {
         *interrupted_out = true;
         agent_publish_system_status(w, "Stopped by user");
@@ -4875,6 +4860,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         char append_err[160] = {0};
         int fits = agent_tool_observation_fits(w, &observation, result_reserve,
                                                &projected_tokens, append_err, sizeof(append_err));
+        dbg_log('T', "tool obs fits=%d projected=%d", fits, projected_tokens);
         if (fits < 0) goto observation_error;
         if (!fits) {
             if (!agent_worker_compact(w, "tool result would exceed context",
@@ -4918,6 +4904,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         if (!agent_tool_observation_commit(w, &observation,
                                            append_err, sizeof(append_err)))
             goto observation_error;
+        dbg_log('T', "tool observation committed");
         agent_tool_observation_free(&observation);
         agent_dsml_parser_free(&dsml);
         carried_generation = 0;
@@ -5228,13 +5215,15 @@ static void server_dispatch(agent_worker *w, unsigned char *frame, size_t len) {
         }
         pthread_mutex_lock(&w->mu);
         bool paused = w->tool_result_pending;
-        if (paused) w->tool_result_pending = false;
-        pthread_mutex_unlock(&w->mu);
         if (paused) {
-            /* paused turn: queue the user message for the next tool round */
-            worker_answer_queued_user_drain(w, text);
-            break;
+            free(w->queued_user_text);
+            w->queued_user_text = text;
+            pthread_cond_signal(&w->cond);
+            dbg_log('T', "queued user during paused tool round (len %zu)",
+                    text ? strlen(text) : 0);
         }
+        pthread_mutex_unlock(&w->mu);
+        if (paused) break;
         pthread_mutex_lock(&w->mu);
         bool idle = w->initialized && w->status.state == AGENT_WORKER_IDLE && !w->cmd_text;
         dbg_log('T', "USER dispatch idle=%d init=%d state=%d",
