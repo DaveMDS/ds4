@@ -2091,17 +2091,24 @@ static bool client_feed_editor(client_editor *ed, client_prompt_queue *queue,
         } else if (cmd[0] == '/') {
             client_handle_command(c, cmd);
         } else if (client_worker_idle(c)) {
+            linenoiseHistoryAdd(cmd);
             client_submit_user(c, cmd);
         } else {
             /* Worker is busy: queue the prompt; drain when idle. */
             client_prompt_queue_push(queue, cmd);
         }
     }
-    /* linenoiseEditFeed's ENTER handler consumed the "current buffer" history
-     * entry that linenoiseEditStart seeds, so re-seed it with this line
-     * (possibly empty) or the next ENTER frees history[-1]. */
-    linenoiseHistoryAdd(cmd);
     linenoiseFree(line);
+    /* Reopen the editor after a submitted line so the prompt is redrawn empty
+     * (the accepted line is not left on screen) and linenoiseEditStart
+     * re-seeds the "current buffer" history slot */
+    if (*running && ed->active) {
+        char saved_prompt[160], saved_status[4096];
+        snprintf(saved_prompt, sizeof(saved_prompt), "%s", ed->prompt);
+        snprintf(saved_status, sizeof(saved_status), "%s", ed->status);
+        editor_stop(ed);
+        editor_start(ed, saved_prompt, saved_status);
+    }
     return true;
 }
 
