@@ -166,8 +166,6 @@ static uint64_t dbg_varint_at(const unsigned char *p, size_t len, size_t *adv) {
 }
 #include "ds4_gpu_args.h"
 
-/* Fullwidth vertical bar (UTF-8 EF BF BC) that frames the DSML marker. */
-#define AGENT_DSML_BAR "\xEF\xBF\xBC"
 
 /* ============================================================================
  * Small helpers (self-contained; ported from ds4_agent.c)
@@ -383,7 +381,7 @@ static void agent_trim_span(const char **p, const char **end) {
 
 static bool agent_dsml_open_tag_is(const char *tag, const char *name) {
     char prefix[64];
-    snprintf(prefix, sizeof(prefix), "<" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "%s", name);
+    snprintf(prefix, sizeof(prefix), "<｜DSML｜%s", name);
     size_t prefix_len = strlen(prefix);
     if (strncmp(tag, prefix, prefix_len) != 0) return false;
     char c = tag[prefix_len];
@@ -392,8 +390,8 @@ static bool agent_dsml_open_tag_is(const char *tag, const char *name) {
 
 static bool agent_dsml_close_tag_at(const char *s, const char *name, size_t *tag_len) {
     char prefix[64];
-    static const char dsml_bar[] = AGENT_DSML_BAR;
-    snprintf(prefix, sizeof(prefix), "</" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "%s", name);
+    static const char dsml_bar[] = "｜";
+    snprintf(prefix, sizeof(prefix), "</｜DSML｜%s", name);
     size_t prefix_len = strlen(prefix);
     if (strncmp(s, prefix, prefix_len) != 0) return false;
     const char *p = s + prefix_len;
@@ -411,8 +409,8 @@ static bool agent_dsml_close_tag_at(const char *s, const char *name, size_t *tag
  * parameter to finish. */
 static bool agent_dsml_parameter_close_tail(const char *tail, size_t len,
                                             bool *complete) {
-    static const char prefix[] = "</" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "parameter";
-    static const char dsml_bar[] = AGENT_DSML_BAR;
+    static const char prefix[] = "</｜DSML｜parameter";
+    static const char dsml_bar[] = "｜";
     const size_t prefix_len = sizeof(prefix) - 1;
     const size_t bar_len = sizeof(dsml_bar) - 1;
     *complete = false;
@@ -484,7 +482,7 @@ static void agent_dsml_update_param_close_prefix(agent_dsml_parser *p) {
  * prose does not become a tool call. */
 static char *agent_dsml_find_close_tag(const char *s, const char *name, size_t *tag_len) {
     const char *p = s;
-    while ((p = strstr(p, "</" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR)) != NULL) {
+    while ((p = strstr(p, "</｜DSML｜")) != NULL) {
         if (agent_dsml_close_tag_at(p, name, tag_len)) return (char *)p;
         p++;
     }
@@ -661,7 +659,7 @@ static void agent_dsml_parse(agent_dsml_parser *p) {
             agent_tool_call_add_arg(&p->current, p->param_name ? p->param_name : "",
                                     p->raw + p->param_value_start,
                                     (size_t)(end - (p->raw + p->param_value_start)),
-                                    p->param_is_string, "</" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "parameter>");
+                                    p->param_is_string, "</｜DSML｜parameter>");
             p->param_close_prefix = false;
             free(p->param_name);
             p->param_name = NULL;
@@ -731,7 +729,7 @@ static void agent_dsml_parse(agent_dsml_parser *p) {
 
 static void agent_dsml_start(agent_dsml_parser *p) {
     const char *start = p->syntax == AGENT_TOOL_SYNTAX_GLM ?
-        "<tool_call>" : "<" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "tool_calls>";
+        "<tool_call>" : "<｜DSML｜tool_calls>";
     p->state = AGENT_DSML_STRUCTURAL;
     p->search_len = 0;
     agent_dsml_raw_append(p, start, strlen(start));
@@ -740,7 +738,7 @@ static void agent_dsml_start(agent_dsml_parser *p) {
 
 static void agent_dsml_feed(agent_dsml_parser *p, const char *s, size_t n) {
     const char *start = p->syntax == AGENT_TOOL_SYNTAX_GLM ?
-        "<tool_call>" : "<" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "tool_calls>";
+        "<tool_call>" : "<｜DSML｜tool_calls>";
     const size_t start_len = strlen(start);
     if (p->state == AGENT_DSML_DONE || p->state == AGENT_DSML_ERROR) return;
 
@@ -1208,10 +1206,10 @@ static bool agent_stream_dsml_start_match(agent_tool_syntax syntax,
         return false;
     }
 
-    static const char canonical[] = "<" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "tool_calls>";
-    static const char missing_bar[] = "<DSML" AGENT_DSML_BAR "tool_calls>";
-    static const char invoke[] = "<" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "invoke";
-    static const char invoke_missing_bar[] = "<DSML" AGENT_DSML_BAR "invoke";
+    static const char canonical[] = "<｜DSML｜tool_calls>";
+    static const char missing_bar[] = "<DSML｜tool_calls>";
+    static const char invoke[] = "<｜DSML｜invoke";
+    static const char invoke_missing_bar[] = "<DSML｜invoke";
     struct {
         const char *text;
         bool implicit_invoke;
@@ -1253,10 +1251,10 @@ static bool agent_dsml_marker_detector_feed(agent_dsml_marker_detector *d,
     }
     d->tail[d->len++] = c;
 
-    static const char fullwidth_marker[] = AGENT_DSML_BAR "DSML" AGENT_DSML_BAR;
+    static const char fullwidth_marker[] = "｜DSML｜";
     static const char ascii_marker[] = "|DSML|";
-    static const char missing_open[] = "<DSML" AGENT_DSML_BAR;
-    static const char missing_close[] = "</DSML" AGENT_DSML_BAR;
+    static const char missing_open[] = "<DSML｜";
+    static const char missing_close[] = "</DSML｜";
     return agent_tail_matches(d->tail, d->len,
                               fullwidth_marker, sizeof(fullwidth_marker) - 1) ||
            agent_tail_matches(d->tail, d->len,
@@ -1288,9 +1286,9 @@ static void agent_stream_note_plain_dsml_byte(agent_stream_renderer *sr,
  * detector.  The detector must hold short prefixes because the model can split
  * the tool_calls marker across arbitrary tokens. */
 static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
-    static const char canonical_invoke[] = "<" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "invoke";
+    static const char canonical_invoke[] = "<｜DSML｜invoke";
     const char *start = sr->syntax == AGENT_TOOL_SYNTAX_GLM ?
-        "<tool_call>" : "<" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "tool_calls>";
+        "<tool_call>" : "<｜DSML｜tool_calls>";
     if (sr->parser->state == AGENT_DSML_ERROR) return;
     agent_stream_note_thinking_dsml_byte(sr, c);
 
@@ -1633,9 +1631,7 @@ static void agent_apply_model_sampling_defaults(
     if (!gen->min_p_set) gen->min_p = 0.0f;
 }
 
-/* ---- Prompt text (ported from ds4_agent.c; edit-upto variants dropped).
- *      The DSML markers are written as AGENT_DSML_BAR macro concatenations so
- *      this file stays ASCII-only; the compiler resolves them to the marker. */
+/* ---- Prompt text (ported from ds4_agent.c; edit-upto variants dropped). */
 
 #define AGENT_TOOL_CONTRACTS \
     "Read output is limited to 128 KiB. Use more to continue, including within an oversized line; " \
@@ -1652,15 +1648,15 @@ static const char agent_tools_prompt_intro[] =
     "then summarize results briefly.\n\n"
     "## Tools\n\n"
     "You have access to native DSML tools. Invoke tools by writing exactly this shape:\n\n"
-    "<" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "tool_calls>\n"
-    "<" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "invoke name=\"$TOOL_NAME\">\n"
-    "<" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "parameter>\n"
-    "</" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "invoke>\n"
-    "</" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "tool_calls>\n\n"
+    "<｜DSML｜tool_calls>\n"
+    "<｜DSML｜invoke name=\"$TOOL_NAME\">\n"
+    "<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n"
+    "</｜DSML｜invoke>\n"
+    "</｜DSML｜tool_calls>\n\n"
     "Tool calls are not allowed inside <think></think>; finish thinking before emitting DSML.\n\n"
     "String parameters use raw text and string=\"true\". Numbers and booleans use JSON text and string=\"false\".\n\n"
-    "Inside string values only, escape a literal closing parameter tag as &lt;/" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "parameter>. "
-    "To write that escaped spelling literally, use &amp;lt;/" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "parameter>. Other HTML entities are unchanged.\n\n"
+    "Inside string values only, escape a literal closing parameter tag as &lt;/｜DSML｜parameter>. "
+    "To write that escaped spelling literally, use &amp;lt;/｜DSML｜parameter>. Other HTML entities are unchanged.\n\n"
     "Read defaults to a context-sized bounded chunk, not the whole file. "
     "For first looks at large files, prefer read with explicit max_lines around 80-160; "
     "if read says more lines are available, call more with count=<lines> to read the next chunk. "
@@ -2566,9 +2562,9 @@ static char *agent_session_title_from_prompt(const char *prompt,
 static char *agent_session_title_from_text(const char *text, size_t text_len,
                                            size_t max_bytes) {
     static const char user_mark[] =
-        "<" AGENT_DSML_BAR "User" AGENT_DSML_BAR ">";
+        "<｜User｜>";
     static const char assistant_mark[] =
-        "<" AGENT_DSML_BAR "Assistant" AGENT_DSML_BAR ">";
+        "<｜Assistant｜>";
     const char *p = text ? strstr(text, user_mark) : NULL;
     if (!p) return xstrdup("(no user prompt)");
     p += strlen(user_mark);
@@ -3656,7 +3652,7 @@ static int agent_compact_tail_start(agent_worker *w, int bottom, int sys_len) {
         tail_budget = AGENT_COMPACT_TAIL_CAP_TOKENS;
     if (tail_budget < 1) tail_budget = 1;
     int user_id = agent_special_token_id(w->engine,
-        ds4_engine_is_glm_dsa(w->engine) ? "<|user|>" : "<" AGENT_DSML_BAR "User" AGENT_DSML_BAR ">");
+        ds4_engine_is_glm_dsa(w->engine) ? "<|user|>" : "<｜User｜>");
     return agent_compact_tail_boundary(&w->transcript, bottom, sys_len, tail_budget, user_id);
 }
 
@@ -3786,7 +3782,7 @@ static bool agent_worker_compact_transcript(agent_worker *w, const char *reason,
     agent_buf summary = {0};
     char eval_err[160] = {0};
     int dsml_id = agent_special_token_id(w->engine,
-        "<" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR ">");
+        "<｜DSML｜>");
     double t0 = now_sec();
     for (int i = 0; i < summary_max; i++) {
         if (worker_should_interrupt(w)) {
@@ -4058,11 +4054,11 @@ static void worker_set_greedy_sampling(agent_worker *w, bool greedy) {
 
 static const char agent_dsml_syntax_reminder[] =
     "DSML syntax reminder:\n"
-    "<" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "tool_calls>\n"
-    "<" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "invoke name=\"$TOOL_NAME\">\n"
-    "<" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "parameter>\n"
-    "</" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "invoke>\n"
-    "</" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "tool_calls>\n";
+    "<｜DSML｜tool_calls>\n"
+    "<｜DSML｜invoke name=\"$TOOL_NAME\">\n"
+    "<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n"
+    "</｜DSML｜invoke>\n"
+    "</｜DSML｜tool_calls>\n";
 
 static const char agent_glm_syntax_reminder[] =
     "GLM tool-call syntax reminder:\n"
@@ -5792,11 +5788,11 @@ static void test_agent_tool_argument_literal_markup(void) {
         "&lt;/arg_value> &amp;lt;/arg_value></arg_value></tool_call>",
     };
     const char *deepseek[] = {
-        "<" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "tool_calls><" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "invoke name=\"write\"><" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "parameter name=\"content\" string=\"true\"><p>&amp; &lt;</p> </tool_call> </think> ",
-        "&lt;/" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "parameter> &amp;lt;/" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "parameter></" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "parameter></" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "invoke></" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "tool_calls>",
+        "<｜DSML｜tool_calls><｜DSML｜invoke name=\"write\"><｜DSML｜parameter name=\"content\" string=\"true\"><p>&amp; &lt;</p> </tool_call> </think> ",
+        "&lt;/｜DSML｜parameter> &amp;lt;/｜DSML｜parameter></｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>",
     };
     const char *expected[] = {
-        "<p>&amp; &lt;</p> </tool_call> </think> </" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "parameter> &lt;/" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "parameter>",
+        "<p>&amp; &lt;</p> </tool_call> </think> </｜DSML｜parameter> &lt;/｜DSML｜parameter>",
         "<p>&amp; &lt;</p> </tool_call> </think> </arg_value> &lt;/arg_value>",
     };
     for (int is_glm = 0; is_glm <= 1; is_glm++) {
@@ -5875,10 +5871,10 @@ static void test_agent_glm_stream_greedy_sampling_boundaries(void) {
 
 static void test_agent_dsml_stream_tool_call_chunked(void) {
     const char *chunks[] = {
-        "<" AGENT_DSML_BAR "D",
-        "SML" AGENT_DSML_BAR "tool_calls><" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "invoke name=\"read\">"
-        "<" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "parameter name=\"path\" string=\"true\">ds4_agent.c</" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "parameter>"
-        "</" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "invoke></" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "tool_calls>",
+        "<｜D",
+        "SML｜tool_calls><｜DSML｜invoke name=\"read\">"
+        "<｜DSML｜parameter name=\"path\" string=\"true\">ds4_agent.c</｜DSML｜parameter>"
+        "</｜DSML｜invoke></｜DSML｜tool_calls>",
     };
     agent_dsml_parser p;
     char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_DSML,
@@ -5942,8 +5938,8 @@ static void test_agent_session_identity_sha(void) {
 }
 
 static void test_agent_session_title_from_text(void) {
-#define T_USER "<" AGENT_DSML_BAR "User" AGENT_DSML_BAR ">"
-#define T_ASSISTANT "<" AGENT_DSML_BAR "Assistant" AGENT_DSML_BAR ">"
+#define T_USER "<｜User｜>"
+#define T_ASSISTANT "<｜Assistant｜>"
     char *t = agent_session_title_from_text(
         "prefix " T_USER " what is the capital of france? " T_ASSISTANT " paris",
         strlen("prefix " T_USER " what is the capital of france? " T_ASSISTANT " paris"), 0);
@@ -5999,7 +5995,7 @@ static void test_agent_session_title_from_file(void) {
     AGENT_TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
 
     static const char text[] =
-        "pre <" AGENT_DSML_BAR "User" AGENT_DSML_BAR "> from the transcript <" AGENT_DSML_BAR "Assistant" AGENT_DSML_BAR "> ok";
+        "pre <｜User｜> from the transcript <｜Assistant｜> ok";
     uint8_t tb[4];
     ds4_kvstore_le_put32(tb, (uint32_t)(sizeof(text) - 1));
     AGENT_TEST_ASSERT(fwrite(tb, 1, 4, fp) == 4);
