@@ -60,6 +60,82 @@
 #include "ds4_tp.h"
 #include "ds4_distributed.h"
 #include "ds4_prompt_prefix.h"
+
+/* ============================================================================
+ * Debug logging (opt-in: DS4_AGENT_DEBUG=1)
+ *
+ * Three line categories, colored and timestamped:
+ *   <cyan>    client -> server   (frames received)
+ *   <green>   server -> client   (frames sent; the per-token TOKEN stream is
+ *                                skipped so generation does not flood stderr)
+ *   <magenta> state / flow       (worker state transitions, dispatch decisions)
+ *
+ * The timestamp is on the left so a live session reads as a clear timeline.
+ * ========================================================================== */
+
+static int dbg_on;
+
+static void dbg_init(void) {
+    const char *e = getenv("DS4_AGENT_DEBUG");
+    dbg_on = e && e[0] != '\0';
+}
+
+static void dbg_stamp(char *buf, size_t len) {
+    struct timespec ts;
+    struct tm tm;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    localtime_r(&ts.tv_sec, &tm);
+    snprintf(buf, len, "%02d:%02d:%02d.%03ld",
+             tm.tm_hour, tm.tm_min, tm.tm_sec,
+             (long)(ts.tv_nsec / 1000000));
+}
+
+static void dbg_log(char cat, const char *fmt, ...) {
+    if (!dbg_on) return;
+    char stamp[32], msg[512];
+    const char *color = cat == 'C' ? "\x1b[36m" :
+                        cat == 'S' ? "\x1b[32m" : "\x1b[35m";
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    dbg_stamp(stamp, sizeof(stamp));
+    fprintf(stderr, "%s %s%s\x1b[0m\n", stamp, color, msg);
+}
+
+static const char *dbg_tag_name(unsigned char tag) {
+    switch (tag) {
+    case PROTO_C2S_NEW_SESSION: return "NEW_SESSION";
+    case PROTO_C2S_USER:        return "USER";
+    case PROTO_C2S_TOOL_RESULT: return "TOOL_RESULT";
+    case PROTO_C2S_SYSTEM:      return "SYSTEM";
+    case PROTO_C2S_STOP_TURN:   return "STOP_TURN";
+    case PROTO_C2S_INTERRUPT:   return "INTERRUPT";
+    case PROTO_C2S_COMPACT:     return "COMPACT";
+    case PROTO_C2S_SAVE:        return "SAVE";
+    case PROTO_C2S_LIST:        return "LIST";
+    case PROTO_C2S_SWITCH:      return "SWITCH";
+    case PROTO_C2S_DEL:         return "DEL";
+    case PROTO_C2S_STRIP:       return "STRIP";
+    case PROTO_C2S_HISTORY:     return "HISTORY";
+    case PROTO_C2S_TOKENS:      return "TOKENS";
+    case PROTO_C2S_POWER:       return "POWER";
+    case PROTO_C2S_ATTACH_IMAGE: return "ATTACH_IMAGE";
+    case PROTO_S2C_HELLO:       return "HELLO";
+    case PROTO_S2C_STATUS:      return "STATUS";
+    case PROTO_S2C_TOKEN:       return "TOKEN";
+    case PROTO_S2C_TURN_PAUSED: return "TURN_PAUSED";
+    case PROTO_S2C_TOOL_CALLS:  return "TOOL_CALLS";
+    case PROTO_S2C_SWITCH_DONE: return "SWITCH_DONE";
+    case PROTO_S2C_COMPACT_DONE: return "COMPACT_DONE";
+    case PROTO_S2C_SAVE_DONE:   return "SAVE_DONE";
+    case PROTO_S2C_HISTORY:     return "HISTORY";
+    case PROTO_S2C_LIST:        return "LIST";
+    case PROTO_S2C_COUNT:       return "COUNT";
+    case PROTO_S2C_ERROR:       return "ERROR";
+    default:                    return "?";
+    }
+}
 #include "ds4_gpu_args.h"
 
 /* Fullwidth vertical bar (UTF-8 EF BF BC) that frames the DSML marker. */
@@ -2513,6 +2589,15 @@ static char *agent_session_title_from_file(const char *path, size_t max_bytes) {
 /* ---- Socket write helper (worker is the only writer) ---- */
 
 static bool agent_send_all(int fd, const void *buf, size_t len) {
+    if (fd < 0) return true;  /* No client connected yet */
+
+    /* Debug: log every frame sent to the client except the per-token TOKEN
+     * stream (that would flood stderr during generation). */
+    if (dbg_on && len >= 5 && buf) {
+        unsigned char tag = ((const unsigned char *)buf)[4];
+        if (tag != PROTO_S2C_TOKEN)
+            dbg_log('S', "%s -> client (len %zu)", dbg_tag_name(tag), len);
+    }
     const unsigned char *p = buf;
     size_t n = 0;
     while (n < len) {
@@ -2573,7 +2658,7 @@ static void agent_set_status(agent_worker *w, agent_worker_state state) {
     w->last_status_push_at = 0.0;
     pthread_mutex_unlock(&w->mu);
     if (old != state)
-        fprintf(stderr, "ds4-agent-server: state %s -> %s\n",
+        dbg_log('T', "state %s -> %s",
                 agent_state_name(old), agent_state_name(state));
     agent_push_status(w, true);
 }
@@ -2587,8 +2672,7 @@ static void agent_set_error(agent_worker *w, const char *msg) {
              "%s", msg ? msg : "unknown error");
     w->last_status_push_at = 0.0;
     pthread_mutex_unlock(&w->mu);
-    fprintf(stderr, "ds4-agent-server: state -> error: %s\n",
-            msg ? msg : "unknown error");
+    dbg_log('T', "state -> error: %s", msg ? msg : "unknown error");
     agent_push_status(w, true);
 }
 
@@ -4400,7 +4484,7 @@ static bool agent_stream_compaction_needs_lookahead(const agent_stream_renderer 
  * client-side, so parsed calls travel on TOOL_CALLS/TURN_PAUSED/TOOL_RESULT). */
 
 static int worker_run_turn(agent_worker *w, const char *user_text) {
-    fprintf(stderr, "ds4-agent-server: worker_run_turn start (user len %zu)\n",
+    dbg_log('T', "worker_run_turn start (user len %zu)",
             user_text ? strlen(user_text) : 0);
     agent_config *cfg = w->cfg;
     ds4_think_mode think_mode = effective_think_mode(cfg);
@@ -4952,7 +5036,7 @@ static void *worker_main(void *arg) {
         w->cmd_text = NULL;
         w->cmd_system = false;
         pthread_mutex_unlock(&w->mu);
-        fprintf(stderr, "ds4-agent-server: worker_main got cmd (len %zu)\n",
+        dbg_log('T', "worker_main got cmd (len %zu)",
                 cmd ? strlen(cmd) : 0);
 
         if (cmd_system) {
@@ -5102,7 +5186,7 @@ static void server_dispatch(agent_worker *w, unsigned char *frame, size_t len) {
         break;
     }
     case PROTO_C2S_USER: {
-        fprintf(stderr, "ds4-agent-server: received USER frame (len %zu)\n", len);
+        dbg_log('C', "client -> USER (len %zu)", len);
         char *text = NULL;
         if (!proto_decode_string(frame, len, tag, &tag, &text)) {
             server_send_error(w, "malformed USER");
@@ -5119,7 +5203,7 @@ static void server_dispatch(agent_worker *w, unsigned char *frame, size_t len) {
         }
         pthread_mutex_lock(&w->mu);
         bool idle = w->initialized && w->status.state == AGENT_WORKER_IDLE && !w->cmd_text;
-        fprintf(stderr, "ds4-agent-server: USER dispatch idle=%d init=%d state=%d\n",
+        dbg_log('T', "USER dispatch idle=%d init=%d state=%d",
                 (int)idle, (int)w->initialized, (int)w->status.state);
         if (idle) {
             free(w->cmd_text);
@@ -5127,11 +5211,11 @@ static void server_dispatch(agent_worker *w, unsigned char *frame, size_t len) {
             w->cmd_system = false;
             pthread_cond_signal(&w->cond);
             pthread_mutex_unlock(&w->mu);
-            fprintf(stderr, "ds4-agent-server: queued USER to worker thread\n");
+            dbg_log('T', "queued USER to worker thread");
         } else {
             pthread_mutex_unlock(&w->mu);
             server_send_error(w, "model is busy; wait for the turn to finish");
-            fprintf(stderr, "ds4-agent-server: USER dropped (model busy)\n");
+            dbg_log('T', "USER dropped (model busy)");
             free(text);
         }
         break;
@@ -5356,7 +5440,7 @@ static int server_accept(const agent_config *cfg, agent_worker *w) {
     close(listen_fd);
     if (sock < 0) return -1;
     w->sock_fd = sock;
-    fprintf(stderr, "ds4-agent-server: client connected\n");
+    dbg_log('T', "client connected");
     /* Wait for the worker thread's startup system-prompt prefill to finish
      * before dispatching NEW_SESSION on the main thread.  Otherwise two
      * threads drive GPU prefill concurrently on the same engine/session,
@@ -5374,11 +5458,11 @@ static int server_run(agent_worker *w) {
         unsigned char *frame = NULL;
         size_t len = 0;
         if (!server_read_frame(w->sock_fd, &frame, &len)) {
-            fprintf(stderr, "ds4-agent-server: client disconnected\n");
+            dbg_log('T', "client disconnected");
             break;
         }
-        fprintf(stderr, "ds4-agent-server: received frame len=%zu tag=%u\n", len,
-                len ? frame[0] : 0);
+        dbg_log('C', "client -> %s (len %zu)",
+                len ? dbg_tag_name(frame[0]) : "?", len);
         server_dispatch(w, frame, len);
         free(frame);
     }
@@ -5390,6 +5474,7 @@ static int server_run(agent_worker *w) {
 }
 
 int main(int argc, char **argv) {
+    dbg_init();
     agent_config cfg = parse_options(argc, argv);
     cfg.engine.context_size = cfg.gen.ctx_size;
     cfg.engine.placement_ctx_hint = cfg.gen.ctx_size;
