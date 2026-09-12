@@ -1408,6 +1408,20 @@ typedef enum {
     AGENT_WORKER_STOPPED,
 } agent_worker_state;
 
+static const char *agent_state_name(agent_worker_state state) {
+    switch (state) {
+    case AGENT_WORKER_IDLE:        return "idle";
+    case AGENT_WORKER_PREFILL:     return "prefill";
+    case AGENT_WORKER_GENERATING:  return "generating";
+    case AGENT_WORKER_COMPACTING:  return "compacting";
+    case AGENT_WORKER_DRAINING:    return "draining";
+    case AGENT_WORKER_SAVING:      return "saving";
+    case AGENT_WORKER_ERROR:       return "error";
+    case AGENT_WORKER_STOPPED:     return "stopped";
+    default:                       return "unknown";
+    }
+}
+
 typedef struct {
     agent_worker_state state;
     int prefill_done;
@@ -2550,6 +2564,7 @@ static void agent_maybe_push_status(agent_worker *w) {
 
 static void agent_set_status(agent_worker *w, agent_worker_state state) {
     pthread_mutex_lock(&w->mu);
+    agent_worker_state old = w->status.state;
     w->status.state = state;
     if (state != AGENT_WORKER_PREFILL)
         w->status.prefill_tps = 0.0;
@@ -2557,6 +2572,9 @@ static void agent_set_status(agent_worker *w, agent_worker_state state) {
         w->status.greedy_sampling = false;
     w->last_status_push_at = 0.0;
     pthread_mutex_unlock(&w->mu);
+    if (old != state)
+        fprintf(stderr, "ds4-agent-server: state %s -> %s\n",
+                agent_state_name(old), agent_state_name(state));
     agent_push_status(w, true);
 }
 
@@ -2569,6 +2587,8 @@ static void agent_set_error(agent_worker *w, const char *msg) {
              "%s", msg ? msg : "unknown error");
     w->last_status_push_at = 0.0;
     pthread_mutex_unlock(&w->mu);
+    fprintf(stderr, "ds4-agent-server: state -> error: %s\n",
+            msg ? msg : "unknown error");
     agent_push_status(w, true);
 }
 
@@ -4288,14 +4308,6 @@ static char *worker_request_tool_result(agent_worker *w) {
     return text;
 }
 
-static bool worker_take_tool_result_request(agent_worker *w) {
-    pthread_mutex_lock(&w->mu);
-    bool pending = w->tool_result_pending;
-    if (pending) w->tool_result_pending = false;
-    pthread_mutex_unlock(&w->mu);
-    return pending;
-}
-
 static void worker_answer_tool_result(agent_worker *w, char *text) {
     pthread_mutex_lock(&w->mu);
     free(w->tool_result_text);
@@ -4388,6 +4400,8 @@ static bool agent_stream_compaction_needs_lookahead(const agent_stream_renderer 
  * client-side, so parsed calls travel on TOOL_CALLS/TURN_PAUSED/TOOL_RESULT). */
 
 static int worker_run_turn(agent_worker *w, const char *user_text) {
+    fprintf(stderr, "ds4-agent-server: worker_run_turn start (user len %zu)\n",
+            user_text ? strlen(user_text) : 0);
     agent_config *cfg = w->cfg;
     ds4_think_mode think_mode = effective_think_mode(cfg);
     pthread_mutex_lock(&w->mu);
@@ -4938,6 +4952,8 @@ static void *worker_main(void *arg) {
         w->cmd_text = NULL;
         w->cmd_system = false;
         pthread_mutex_unlock(&w->mu);
+        fprintf(stderr, "ds4-agent-server: worker_main got cmd (len %zu)\n",
+                cmd ? strlen(cmd) : 0);
 
         if (cmd_system) {
             worker_append_system_message(w, cmd ? cmd : "");
@@ -5086,28 +5102,36 @@ static void server_dispatch(agent_worker *w, unsigned char *frame, size_t len) {
         break;
     }
     case PROTO_C2S_USER: {
+        fprintf(stderr, "ds4-agent-server: received USER frame (len %zu)\n", len);
         char *text = NULL;
         if (!proto_decode_string(frame, len, tag, &tag, &text)) {
             server_send_error(w, "malformed USER");
             break;
         }
         pthread_mutex_lock(&w->mu);
-        if (worker_take_tool_result_request(w)) {
+        bool paused = w->tool_result_pending;
+        if (paused) w->tool_result_pending = false;
+        pthread_mutex_unlock(&w->mu);
+        if (paused) {
             /* paused turn: queue the user message for the next tool round */
-            pthread_mutex_unlock(&w->mu);
             worker_answer_queued_user_drain(w, text);
             break;
         }
+        pthread_mutex_lock(&w->mu);
         bool idle = w->initialized && w->status.state == AGENT_WORKER_IDLE && !w->cmd_text;
+        fprintf(stderr, "ds4-agent-server: USER dispatch idle=%d init=%d state=%d\n",
+                (int)idle, (int)w->initialized, (int)w->status.state);
         if (idle) {
             free(w->cmd_text);
             w->cmd_text = text;
             w->cmd_system = false;
             pthread_cond_signal(&w->cond);
             pthread_mutex_unlock(&w->mu);
+            fprintf(stderr, "ds4-agent-server: queued USER to worker thread\n");
         } else {
             pthread_mutex_unlock(&w->mu);
             server_send_error(w, "model is busy; wait for the turn to finish");
+            fprintf(stderr, "ds4-agent-server: USER dropped (model busy)\n");
             free(text);
         }
         break;
@@ -5332,6 +5356,16 @@ static int server_accept(const agent_config *cfg, agent_worker *w) {
     close(listen_fd);
     if (sock < 0) return -1;
     w->sock_fd = sock;
+    fprintf(stderr, "ds4-agent-server: client connected\n");
+    /* Wait for the worker thread's startup system-prompt prefill to finish
+     * before dispatching NEW_SESSION on the main thread.  Otherwise two
+     * threads drive GPU prefill concurrently on the same engine/session,
+     * which corrupts the ROCm command stream (memory aperture violation
+     * -> abort): the worker's startup reset races the NEW_SESSION reset. */
+    pthread_mutex_lock(&w->mu);
+    while (!w->initialized)
+        pthread_cond_wait(&w->cond, &w->mu);
+    pthread_mutex_unlock(&w->mu);
     return 0;
 }
 
@@ -5339,7 +5373,12 @@ static int server_run(agent_worker *w) {
     for (;;) {
         unsigned char *frame = NULL;
         size_t len = 0;
-        if (!server_read_frame(w->sock_fd, &frame, &len)) break;
+        if (!server_read_frame(w->sock_fd, &frame, &len)) {
+            fprintf(stderr, "ds4-agent-server: client disconnected\n");
+            break;
+        }
+        fprintf(stderr, "ds4-agent-server: received frame len=%zu tag=%u\n", len,
+                len ? frame[0] : 0);
         server_dispatch(w, frame, len);
         free(frame);
     }

@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -832,70 +833,537 @@ static void client_prompt_queue_free(client_prompt_queue *q) {
  * Editor (linenoise; prompt stays above streaming output)
  * ========================================================================== */
 
+#define CLIENT_STATUS_REDRAW_INTERVAL_SEC 0.20
+
+static void write_all(int fd, const char *p, size_t n) {
+    if (fd == STDOUT_FILENO) {
+        linenoiseWrite(fd, p, n);
+        return;
+    }
+    while (n) {
+        ssize_t wr = write(fd, p, n);
+        if (wr <= 0) {
+            if (wr < 0 && errno == EINTR) continue;
+            return;
+        }
+        p += (size_t)wr;
+        n -= (size_t)wr;
+    }
+}
+
+static bool stdout_is_tty(void) {
+    return isatty(STDOUT_FILENO) != 0;
+}
+
+static bool agent_footer_is_multiline(const char *status) {
+    return status && strchr(status, '\n');
+}
+
 typedef struct {
     struct linenoiseState edit;
     char *input_buf;
     size_t input_buf_len;
     char prompt[160];
     char status[4096];
+    bool prompt_dirty, status_dirty;
     bool active;
     bool hidden;
     bool output_line_open;
+    bool output_pending_wrap;
     char output_utf8[4];
     size_t output_utf8_len;
+    int output_escape;
+    bool output_zwj, output_regional;
+    int output_glyph_width;
+    bool prompt_below_output;
+    int output_col;
+    bool scroll_region;
+    int term_rows;
+    int term_cols;
+    int output_bottom;
+    int prompt_row;
+    int reserved_rows;
+    bool output_cursor_saved;
+    bool output_at_scroll_boundary;
+    agent_buf deferred_output;
+    double last_prompt_redraw_time;
     int old_stdin_flags;
 } client_editor;
 
-static bool editor_write_preserve_prompt(client_editor *ed, const char *text, size_t len) {
-    if (!text || !len) return false;
-    if (ed->active) linenoiseEditStop(&ed->edit);
-    ed->active = false;
-    ed->hidden = false;
-    ssize_t n = write(STDOUT_FILENO, text, len);
-    (void)n;
-    return true;
+static void editor_clear_deferred(client_editor *ed) {
+    free(ed->deferred_output.ptr);
+    ed->deferred_output.ptr = NULL;
+    ed->deferred_output.len = 0;
+    ed->deferred_output.cap = 0;
+    ed->deferred_output.limit = 0;
+    ed->deferred_output.truncated = false;
 }
 
 static void editor_status_escapes(const char *status, const char **start, const char **end) {
-    bool tty = isatty(STDOUT_FILENO) != 0;
+    bool tty = stdout_is_tty();
     bool embedded = status && strchr(status, '\n');
     *start = tty && !embedded ? CLIENT_STATUS_STYLE_START : "";
     *end = tty && status && status[0] ? CLIENT_STATUS_STYLE_END : "";
 }
 
-static void editor_start(client_editor *ed, const char *prompt, const char *status) {
-    memset(ed, 0, sizeof(*ed));
-    ed->input_buf_len = 4096;
-    ed->input_buf = xmalloc(ed->input_buf_len);
-    linenoiseEditStart(&ed->edit, STDIN_FILENO, STDOUT_FILENO, ed->input_buf,
-                       ed->input_buf_len, prompt);
-    const char *sstart = "", *send = "";
-    editor_status_escapes(status, &sstart, &send);
-    linenoiseEditSetStatus(&ed->edit, status, sstart, send);
-    ed->active = true;
-    ed->hidden = false;
+static bool editor_get_terminal_size(int *rows, int *cols) {
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) != 0) return false;
+    if (ws.ws_row < 1 || ws.ws_col < 1) return false;
+    *rows = ws.ws_row;
+    *cols = ws.ws_col;
+    return true;
 }
 
-static void editor_stop(client_editor *ed) {
-    if (ed->active) linenoiseEditStop(&ed->edit);
-    ed->active = false;
-    free(ed->input_buf);
-    ed->input_buf = NULL;
+static void editor_csi_cursor(int row, int col) {
+    char seq[64];
+    int n = snprintf(seq, sizeof(seq), "\x1b[%d;%dH", row, col);
+    if (n > 0) write_all(STDOUT_FILENO, seq, (size_t)n);
+}
+
+static void editor_set_scroll_margin(int bottom) {
+    char seq[96];
+    int n = snprintf(seq, sizeof(seq), "\x1b[1;%dr", bottom);
+    if (n > 0) write_all(STDOUT_FILENO, seq, (size_t)n);
+}
+
+static void editor_scroll_output_up(int bottom, int lines) {
+    if (lines <= 0) return;
+    editor_set_scroll_margin(bottom);
+    editor_csi_cursor(bottom, 1);
+    for (int i = 0; i < lines; i++)
+        write_all(STDOUT_FILENO, "\n", 1);
+}
+
+static void editor_save_output_cursor(client_editor *ed) {
+    if (!ed->scroll_region) return;
+    write_all(STDOUT_FILENO, "\0337", 2);
+    ed->output_cursor_saved = true;
+}
+
+static void editor_restore_output_cursor(client_editor *ed) {
+    if (!ed->scroll_region) return;
+    if (ed->output_cursor_saved) {
+        write_all(STDOUT_FILENO, "\0338", 2);
+    } else {
+        editor_csi_cursor(ed->output_bottom, 1);
+    }
+}
+
+static void editor_move_to_prompt_row(client_editor *ed) {
+    if (!ed->scroll_region) return;
+    editor_csi_cursor(ed->prompt_row, 1);
+}
+
+static void editor_move_to_prompt_cursor(client_editor *ed) {
+    if (!ed->scroll_region) return;
+    if (ed->edit.screen_cursor_row > 0 && ed->edit.screen_cursor_col > 0) {
+        editor_csi_cursor(ed->edit.screen_cursor_row, ed->edit.screen_cursor_col);
+    } else {
+        editor_move_to_prompt_row(ed);
+    }
+}
+
+static void editor_clear_row(int row) {
+    editor_csi_cursor(row, 1);
+    write_all(STDOUT_FILENO, "\r\x1b[0K", 5);
+}
+
+static void editor_clear_prompt_region(client_editor *ed) {
+    if (!ed->scroll_region) return;
+    for (int row = ed->prompt_row; row <= ed->term_rows; row++)
+        editor_clear_row(row);
+    ed->edit.oldrows = 0;
+    ed->edit.oldstatusrows = 0;
+    ed->edit.oldrpos = 1;
+    ed->edit.oldpos = ed->edit.pos;
+}
+
+static bool editor_set_scroll_layout(client_editor *ed, int reserved_rows,
+                                     bool allow_shrink, bool scroll_on_grow) {
+    if (!ed->scroll_region) return false;
+
+    int rows = 0, cols = 0;
+    if (!editor_get_terminal_size(&rows, &cols)) return false;
+    if (rows < 8 || cols < 20) return false;
+    if (reserved_rows < 2) reserved_rows = 2;
+    if (reserved_rows > rows - 2) reserved_rows = rows - 2;
+    if (!allow_shrink && ed->reserved_rows > 0 &&
+        ed->term_rows == rows && ed->term_cols == cols &&
+        reserved_rows < ed->reserved_rows)
+    {
+        reserved_rows = ed->reserved_rows;
+    }
+
+    int output_bottom = rows - reserved_rows;
+    int prompt_row = output_bottom + 1;
+    bool changed = ed->term_rows != rows ||
+                   ed->term_cols != cols ||
+                   ed->output_bottom != output_bottom ||
+                   ed->prompt_row != prompt_row ||
+                   ed->reserved_rows != reserved_rows;
+    if (!changed) return true;
+
+    bool scrolled_output = false;
+    if (scroll_on_grow &&
+        ed->term_rows == rows && ed->term_cols == cols &&
+        ed->output_bottom > 0 && output_bottom < ed->output_bottom)
+    {
+        editor_scroll_output_up(ed->output_bottom,
+                                ed->output_bottom - output_bottom);
+        scrolled_output = true;
+    }
+
+    editor_set_scroll_margin(output_bottom);
+
+    ed->term_rows = rows;
+    ed->term_cols = cols;
+    ed->output_bottom = output_bottom;
+    ed->prompt_row = prompt_row;
+    ed->reserved_rows = reserved_rows;
+    ed->output_cursor_saved = false;
+    ed->output_at_scroll_boundary = scrolled_output;
+
+    for (int row = prompt_row; row <= rows; row++)
+        editor_clear_row(row);
+
+    int output_col = ed->output_line_open ? ed->output_col + 1 : 1;
+    if (output_col < 1) output_col = 1;
+    if (output_col > cols) output_col = cols;
+    editor_csi_cursor(output_bottom, output_col);
+    editor_save_output_cursor(ed);
+    editor_move_to_prompt_row(ed);
+    return true;
+}
+
+static int editor_linenoise_layout_changed(struct linenoiseState *l,
+                                           size_t prompt_rows,
+                                           size_t status_rows,
+                                           void *privdata) {
+    (void)l;
+    client_editor *ed = privdata;
+    if (!ed || !ed->scroll_region) return 0;
+    if (prompt_rows < 1) prompt_rows = 1;
+    int reserved = (int)(prompt_rows + status_rows);
+    if (!editor_set_scroll_layout(ed, reserved, true, true)) return 0;
+    return ed->prompt_row;
+}
+
+static bool editor_configure_scroll_region(client_editor *ed) {
+    if (ed->scroll_region) return true;
+    if (!isatty(STDIN_FILENO) || !stdout_is_tty()) return false;
+
+    int rows = 0, cols = 0;
+    if (!editor_get_terminal_size(&rows, &cols)) return false;
+    if (rows < 8 || cols < 20) return false;
+
+    ed->term_rows = 0;
+    ed->term_cols = 0;
+    ed->output_bottom = 0;
+    ed->prompt_row = 0;
+    ed->reserved_rows = 0;
+    ed->output_cursor_saved = false;
+    ed->output_at_scroll_boundary = false;
+    ed->scroll_region = true;
+    if (!editor_set_scroll_layout(ed, 2, true, false)) return false;
+
+    editor_scroll_output_up(ed->output_bottom, 1);
+    ed->output_cursor_saved = false;
+    editor_csi_cursor(ed->output_bottom, 1);
+    editor_save_output_cursor(ed);
+    editor_move_to_prompt_row(ed);
+    return true;
+}
+
+static void editor_restore_terminal_layout(client_editor *ed) {
+    if (!ed->scroll_region) return;
+    write_all(STDOUT_FILENO, "\x1b[0m", 4);
+    write_all(STDOUT_FILENO, "\x1b[r", 3);
+    editor_csi_cursor(ed->term_rows, 1);
+    write_all(STDOUT_FILENO, "\r\x1b[0K\r\n", 7);
+    ed->scroll_region = false;
+    ed->output_cursor_saved = false;
+    ed->term_rows = ed->term_cols = 0;
+    ed->output_bottom = ed->prompt_row = 0;
+    ed->reserved_rows = 0;
+    ed->output_at_scroll_boundary = false;
+}
+
+/* Track streamed text with the same widths as linenoise. Partial UTF-8 and
+ * escape sequences remain pending across worker-output chunks. */
+static void editor_note_output(client_editor *ed, const char *text, size_t len) {
+    int cols = ed->edit.cols > 0 ? (int)ed->edit.cols : 80;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)text[i];
+        if (ed->output_escape) {
+            if (ed->output_escape == 1) ed->output_escape = c == '[' ? 2 : 0;
+            else if (c >= 0x40 && c <= 0x7e) ed->output_escape = 0;
+            continue;
+        }
+        if (c == 0x1b && !ed->output_utf8_len) { ed->output_escape = 1; continue; }
+        uint32_t cp = c;
+        if (ed->output_utf8_len || c >= 0x80) {
+            if (ed->output_utf8_len && (c & 0xc0) != 0x80) {
+                ed->output_utf8_len = 0;
+                ed->output_col = (ed->output_col + 1) % cols;
+            }
+            ed->output_utf8[ed->output_utf8_len++] = (char)c;
+            size_t n = linenoiseUtf8Decode(ed->output_utf8, ed->output_utf8_len, &cp);
+            if (!n) continue;
+            ed->output_utf8_len = 0;
+        }
+        if (cp == '\n' || cp == '\r') {
+            ed->output_col = 0;
+            ed->output_pending_wrap = false;
+            if (cp == '\n') ed->output_line_open = false;
+            ed->output_zwj = ed->output_regional = false;
+            ed->output_glyph_width = 0;
+            continue;
+        }
+        if (cp == '\b') {
+            if (ed->output_pending_wrap) ed->output_col = cols - 1;
+            else if (ed->output_col > 0) ed->output_col--;
+            ed->output_pending_wrap = false;
+            continue;
+        }
+        if (cp == '\t') {
+            int col = ed->output_pending_wrap ? cols - 1 : ed->output_col;
+            ed->output_col = (col | 7) + 1;
+            if (ed->output_col >= cols) ed->output_col = cols - 1;
+            ed->output_pending_wrap = false;
+            ed->output_line_open = true;
+            continue;
+        }
+        int width = linenoiseCharacterWidth(cp);
+        bool regional = cp >= 0x1f1e6 && cp <= 0x1f1ff;
+        if (cp == 0x200d) {
+            ed->output_zwj = true;
+            continue;
+        }
+        if (cp == 0xfe0f && ed->output_glyph_width == 1) {
+            width = 1;
+            ed->output_glyph_width = 2;
+        } else if (width) {
+            if (ed->output_zwj || (regional && ed->output_regional)) {
+                width = 0;
+                ed->output_zwj = false;
+                ed->output_regional = false;
+            } else {
+                ed->output_glyph_width = width;
+                ed->output_regional = regional;
+            }
+        }
+        if (width > 0) {
+            if (ed->output_col + width > cols) ed->output_col = 0;
+            ed->output_col = (ed->output_col + width) % cols;
+            ed->output_pending_wrap = ed->output_col == 0;
+            ed->output_line_open = true;
+        }
+    }
+}
+
+/* Normalize generated LF to CRLF for terminal output without changing the text
+ * stored in the transcript. */
+static void editor_write_terminal_text(const char *text, size_t len) {
+    size_t start = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (text[i] != '\n') continue;
+        if (i > start) write_all(STDOUT_FILENO, text + start, i - start);
+        write_all(STDOUT_FILENO, "\r\n", 2);
+        start = i + 1;
+    }
+    if (start < len) write_all(STDOUT_FILENO, text + start, len - start);
+}
+
+static void editor_update_prompt(client_editor *ed, const char *prompt) {
+    if (strcmp(ed->prompt, prompt)) ed->prompt_dirty = true;
+    snprintf(ed->prompt, sizeof(ed->prompt), "%s", prompt);
+    ed->edit.prompt = ed->prompt;
+    ed->edit.plen = strlen(ed->prompt);
+}
+
+static void editor_update_status(client_editor *ed, const char *status) {
+    if (strcmp(ed->status, status ? status : "")) ed->status_dirty = true;
+    snprintf(ed->status, sizeof(ed->status), "%s", status ? status : "");
+    bool embedded_status = agent_footer_is_multiline(ed->status);
+    const char *status_start = stdout_is_tty() && !embedded_status ?
+        CLIENT_STATUS_STYLE_START : "";
+    const char *status_end = stdout_is_tty() && ed->status[0] ?
+        CLIENT_STATUS_STYLE_END : "";
+    linenoiseEditSetStatus(&ed->edit, ed->status, status_start, status_end);
+}
+
+static void editor_redraw_visible_prompt(client_editor *ed) {
+    if (!ed->active || !ed->scroll_region) return;
+    linenoiseBeginUpdate(STDOUT_FILENO);
+    editor_clear_prompt_region(ed);
+    editor_move_to_prompt_row(ed);
+    write_all(STDOUT_FILENO, "\x1b[0m", 4);
+    linenoiseShow(&ed->edit);
+    ed->prompt_dirty = ed->status_dirty = false;
+    ed->last_prompt_redraw_time = now_sec();
+    linenoiseEndUpdate();
+}
+
+static bool editor_prompt_redraw_due(client_editor *ed) {
+    double now = now_sec();
+    if (ed->last_prompt_redraw_time <= 0.0 ||
+        now - ed->last_prompt_redraw_time >= CLIENT_STATUS_REDRAW_INTERVAL_SEC)
+    {
+        return true;
+    }
+    return false;
+}
+
+static void editor_flush_prompt_status(client_editor *ed, bool force) {
+    if (!ed->active || ed->hidden) return;
+    int rows, cols;
+    if (ed->scroll_region && editor_get_terminal_size(&rows, &cols) &&
+        (rows != ed->term_rows || cols != ed->term_cols)) {
+        ed->edit.cols = cols;
+        ed->prompt_dirty = true;
+        force = true;
+    }
+    if (!ed->prompt_dirty && !ed->status_dirty) return;
+    if (!force && !editor_prompt_redraw_due(ed)) return;
+    linenoiseBeginUpdate(STDOUT_FILENO);
+    if (ed->scroll_region) {
+        if (ed->prompt_dirty || !linenoiseRefreshStatus(&ed->edit))
+            editor_redraw_visible_prompt(ed);
+    } else {
+        const char *sstart = "", *send = "";
+        editor_status_escapes(ed->status, &sstart, &send);
+        linenoiseEditSetStatus(&ed->edit, ed->status, sstart, send);
+    }
+    ed->prompt_dirty = ed->status_dirty = false;
+    ed->last_prompt_redraw_time = now_sec();
+    linenoiseEndUpdate();
 }
 
 static void editor_set_prompt_status(client_editor *ed, const char *prompt,
                                      const char *status) {
-    snprintf(ed->prompt, sizeof(ed->prompt), "%s", prompt);
-    snprintf(ed->status, sizeof(ed->status), "%s", status);
-    if (ed->active) {
-        const char *sstart = "", *send = "";
-        editor_status_escapes(status, &sstart, &send);
-        linenoiseEditSetStatus(&ed->edit, status, sstart, send);
+    if (strcmp(ed->prompt, prompt)) editor_update_prompt(ed, prompt);
+    if (strcmp(ed->status, status ? status : "")) editor_update_status(ed, status);
+    editor_flush_prompt_status(ed, false);
+}
+
+static void editor_write_preserve_prompt(client_editor *ed, const char *text, size_t len) {
+    if (!text || !len) return;
+    if (ed->active) linenoiseEditStop(&ed->edit);
+    ed->active = false;
+    ed->hidden = false;
+    write_all(STDOUT_FILENO, text, len);
+}
+
+static bool editor_write_scroll_output_preserve_prompt(client_editor *ed,
+                                                       const char *text,
+                                                       size_t len,
+                                                       bool settle_boundary) {
+    agent_buf_append(&ed->deferred_output, text, len);
+    if (!ed->deferred_output.len) return false;
+
+    client_editor predicted = *ed;
+    editor_note_output(&predicted, ed->deferred_output.ptr,
+                       ed->deferred_output.len);
+    if ((predicted.output_utf8_len || predicted.output_escape) && settle_boundary) {
+        if (predicted.output_utf8_len) {
+            ed->deferred_output.len -= predicted.output_utf8_len;
+            agent_buf_append(&ed->deferred_output, "\xef\xbf\xbd", 3);
+        } else {
+            while (ed->deferred_output.len &&
+                   ed->deferred_output.ptr[--ed->deferred_output.len] != 0x1b) {}
+        }
+        predicted = *ed;
+        editor_note_output(&predicted, ed->deferred_output.ptr,
+                           ed->deferred_output.len);
     }
+    bool at_boundary = predicted.output_pending_wrap;
+    if (predicted.output_utf8_len || predicted.output_escape) return false;
+    if (at_boundary && !settle_boundary) return false;
+
+    linenoiseBeginUpdate(STDOUT_FILENO);
+    editor_restore_output_cursor(ed);
+    editor_write_terminal_text(ed->deferred_output.ptr,
+                               ed->deferred_output.len);
+    editor_note_output(ed, ed->deferred_output.ptr,
+                       ed->deferred_output.len);
+    if (at_boundary) {
+        write_all(STDOUT_FILENO, "\r\n", 2);
+        ed->output_col = 0;
+        ed->output_line_open = false;
+        ed->output_pending_wrap = false;
+    }
+    editor_clear_deferred(ed);
+    editor_save_output_cursor(ed);
+    write_all(STDOUT_FILENO, "\x1b[0m", 4);
+    editor_move_to_prompt_cursor(ed);
+    linenoiseEndUpdate();
+    ed->output_at_scroll_boundary = true;
+    return true;
+}
+
+static void editor_hide(client_editor *ed) {
+    if (!ed->active || ed->hidden) return;
+    if (ed->scroll_region) {
+        editor_clear_prompt_region(ed);
+        editor_restore_output_cursor(ed);
+        ed->hidden = true;
+        return;
+    }
+    linenoiseHide(&ed->edit);
+    if (ed->prompt_below_output) {
+        write_all(STDOUT_FILENO, "\x1b[1A", 4);
+        char seq[64];
+        int n = snprintf(seq, sizeof(seq), "\x1b[%dG", ed->output_col + 1);
+        if (n > 0) write_all(STDOUT_FILENO, seq, (size_t)n);
+        ed->prompt_below_output = false;
+    }
+    ed->hidden = true;
+}
+
+static void editor_show(client_editor *ed) {
+    if (!ed->active || !ed->hidden) return;
+    if (ed->scroll_region) {
+        editor_save_output_cursor(ed);
+        editor_move_to_prompt_row(ed);
+        write_all(STDOUT_FILENO, "\x1b[0m", 4);
+        linenoiseShow(&ed->edit);
+        ed->hidden = false;
+        return;
+    }
+    if (ed->output_line_open) {
+        write_all(STDOUT_FILENO, "\r\n", 2);
+        ed->prompt_below_output = true;
+    } else {
+        ed->prompt_below_output = false;
+    }
+    write_all(STDOUT_FILENO, "\x1b[0m", 4);
+    linenoiseShow(&ed->edit);
+    ed->prompt_dirty = ed->status_dirty = false;
+    ed->last_prompt_redraw_time = now_sec();
+    ed->hidden = false;
 }
 
 static void editor_write_async(client_editor *ed, const char *text, size_t len,
-                               const char *prompt, const char *status) {
+                               const char *prompt, const char *status,
+                               bool force_show) {
+    if (ed->scroll_region && ed->active && !ed->hidden &&
+        (len || ed->deferred_output.len)) {
+        editor_flush_prompt_status(ed, false);
+        bool prompt_changed = strcmp(ed->prompt, prompt) != 0;
+        bool status_changed = strcmp(ed->status, status ? status : "") != 0;
+
+        linenoiseBeginUpdate(STDOUT_FILENO);
+        editor_write_scroll_output_preserve_prompt(ed, text, len, force_show);
+        if (prompt_changed) editor_update_prompt(ed, prompt);
+        if (status_changed) editor_update_status(ed, status);
+        editor_flush_prompt_status(ed, force_show);
+        linenoiseEndUpdate();
+        return;
+    }
+
+    /* Fallback (no scroll region): preserve the prompt by hiding, writing the
+     * output, then redrawing linenoise. */
     if (!len) {
         editor_set_prompt_status(ed, prompt, status);
         return;
@@ -903,14 +1371,72 @@ static void editor_write_async(client_editor *ed, const char *text, size_t len,
     editor_write_preserve_prompt(ed, text, len);
     snprintf(ed->prompt, sizeof(ed->prompt), "%s", prompt);
     snprintf(ed->status, sizeof(ed->status), "%s", status);
-    /* Restart the editor with the same caller-owned input buffer, so any typed
-     * text survives the prompt-preserving output write. */
     linenoiseEditStart(&ed->edit, STDIN_FILENO, STDOUT_FILENO, ed->input_buf,
                        ed->input_buf_len, prompt);
     const char *sstart = "", *send = "";
     editor_status_escapes(status, &sstart, &send);
     linenoiseEditSetStatus(&ed->edit, status, sstart, send);
     ed->active = true;
+}
+
+static void editor_start(client_editor *ed, const char *prompt, const char *status) {
+    memset(ed, 0, sizeof(*ed));
+    ed->input_buf_len = 4096;
+    ed->input_buf = xmalloc(ed->input_buf_len);
+    snprintf(ed->prompt, sizeof(ed->prompt), "%s", prompt);
+    snprintf(ed->status, sizeof(ed->status), "%s", status ? status : "");
+    bool had_scroll_region = ed->scroll_region;
+    bool use_scroll_region = editor_configure_scroll_region(ed);
+    if (use_scroll_region) {
+        if (had_scroll_region)
+            editor_set_scroll_layout(ed, 2, true, false);
+        editor_move_to_prompt_row(ed);
+    }
+    if (linenoiseEditStart(&ed->edit, STDIN_FILENO, STDOUT_FILENO, ed->input_buf,
+                           ed->input_buf_len, ed->prompt) != 0) {
+        editor_restore_terminal_layout(ed);
+        return;
+    }
+    bool embedded_status = agent_footer_is_multiline(ed->status);
+    const char *status_start = stdout_is_tty() && !embedded_status ?
+        CLIENT_STATUS_STYLE_START : "";
+    const char *status_end = stdout_is_tty() && ed->status[0] ?
+        CLIENT_STATUS_STYLE_END : "";
+    linenoiseEditSetStatus(&ed->edit, ed->status, status_start, status_end);
+    linenoiseEditSetLayoutCallback(&ed->edit, editor_linenoise_layout_changed, ed);
+    if (isatty(ed->edit.ifd) || getenv("LINENOISE_ASSUME_TTY")) {
+        linenoiseHide(&ed->edit);
+        linenoiseShow(&ed->edit);
+    }
+    ed->active = true;
+    ed->hidden = false;
+    ed->output_line_open = false;
+    ed->prompt_below_output = false;
+    ed->output_col = 0;
+    ed->output_pending_wrap = false;
+    ed->output_utf8_len = 0;
+    ed->output_escape = 0;
+    ed->output_zwj = ed->output_regional = false;
+    ed->output_glyph_width = 0;
+}
+
+static void editor_stop(client_editor *ed) {
+    if (!ed->active) {
+        free(ed->input_buf);
+        ed->input_buf = NULL;
+        return;
+    }
+    if (ed->deferred_output.len)
+        editor_write_scroll_output_preserve_prompt(ed, NULL, 0, true);
+    if (!ed->hidden && (isatty(ed->edit.ifd) || getenv("LINENOISE_ASSUME_TTY")))
+        editor_hide(ed);
+    linenoiseEditStop(&ed->edit);
+    editor_restore_terminal_layout(ed);
+    free(ed->input_buf);
+    ed->input_buf = NULL;
+    ed->active = false;
+    ed->hidden = false;
+    editor_clear_deferred(ed);
 }
 
 static void editor_read_stdin(client_editor *ed) {
@@ -1538,6 +2064,47 @@ static void client_run_non_interactive(agent_client *c) {
     free(out);
 }
 
+/* Feed one byte/line to the linenoise editor and act on the result.  Returns
+ * false only when the caller should stop the loop (EOF/error or /quit). */
+static bool client_feed_editor(client_editor *ed, client_prompt_queue *queue,
+                               agent_client *c, bool *running) {
+    errno = 0;
+    char *line = linenoiseEditFeed(&ed->edit);
+    if (line == linenoiseEditMore) {
+        /* still editing; more queued bytes processed by the caller */
+        linenoiseFree(line);
+        return true;
+    }
+    if (!line) {
+        if (errno == EAGAIN) return true;
+        *running = false;
+        return false;
+    }
+    char *cmd = line;
+    while (*cmd == ' ' || *cmd == '\t' || *cmd == '\r' || *cmd == '\n') cmd++;
+    char *end = cmd + strlen(cmd);
+    while (end > cmd && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n')) end--;
+    *end = '\0';
+    if (cmd[0]) {
+        if (!strcmp(cmd, "/quit") || !strcmp(cmd, "/exit")) {
+            *running = false;
+        } else if (cmd[0] == '/') {
+            client_handle_command(c, cmd);
+        } else if (client_worker_idle(c)) {
+            client_submit_user(c, cmd);
+        } else {
+            /* Worker is busy: queue the prompt; drain when idle. */
+            client_prompt_queue_push(queue, cmd);
+        }
+    }
+    /* linenoiseEditFeed's ENTER handler consumed the "current buffer" history
+     * entry that linenoiseEditStart seeds, so re-seed it with this line
+     * (possibly empty) or the next ENTER frees history[-1]. */
+    linenoiseHistoryAdd(cmd);
+    linenoiseFree(line);
+    return true;
+}
+
 static void client_run_interactive(agent_client *c) {
     linenoiseSetMultiLine(1);
     linenoiseHistorySetMaxLen(512);
@@ -1577,10 +2144,20 @@ static void client_run_interactive(agent_client *c) {
         client_build_footer_text(&st, client_prompt_queue_peek(&queue),
                                  statusline, sizeof(statusline));
         if (out && out_len) {
-            editor_write_async(&editor, out, out_len, prompt, statusline);
+            bool force_show = st.state == AGENT_IDLE ||
+                              st.state == AGENT_ERROR ||
+                              st.state == AGENT_STOPPED;
+            editor_write_async(&editor, out, out_len, prompt, statusline, force_show);
             free(out);
         } else {
             editor_set_prompt_status(&editor, prompt, statusline);
+            editor_flush_prompt_status(&editor, st.state == AGENT_IDLE ||
+                                       st.state == AGENT_ERROR ||
+                                       st.state == AGENT_STOPPED);
+            if (editor.hidden && (st.state == AGENT_IDLE ||
+                                  st.state == AGENT_ERROR ||
+                                  st.state == AGENT_STOPPED))
+                editor_show(&editor);
         }
 
         if (initial_pending && client_worker_idle(c)) {
@@ -1595,36 +2172,24 @@ static void client_run_interactive(agent_client *c) {
             free(queued);
         }
 
-        errno = 0;
-        char *line = linenoiseEditFeed(&editor.edit);
-        if (line == linenoiseEditMore) {
-            /* still editing */
-        } else if (!line) {
-            if (errno == EAGAIN) {
-                if (!client_worker_idle(c)) client_interrupt(c);
-            } else {
-                running = false;
-            }
+        /* Process input without blocking the event loop on a TTY.
+         * linenoiseEditFeed blocks on a blocking read(STDIN) when no bytes
+         * are queued, which would stall this loop (and streamed output) until
+         * the user presses a key.  Only feed it while queued bytes remain, so
+         * the loop keeps rendering server output during generation.  On a
+         * non-TTY stdin linenoise uses its blocking no-tty readline instead,
+         * so feed it once unconditionally (a whole line arrives at once). */
+        if (isatty(STDIN_FILENO)) {
+            /* TTY: only feed while queued bytes remain, so this loop never
+             * blocks on linenoiseEditFeed's blocking read(STDIN) and keeps
+             * rendering streamed output during generation. */
+            while (running && linenoiseEditQueuedInput(&editor.edit) > 0)
+                if (!client_feed_editor(&editor, &queue, c, &running)) break;
         } else {
-            char *cmd = line;
-            while (*cmd == ' ' || *cmd == '\t' || *cmd == '\r' || *cmd == '\n') cmd++;
-            char *end = cmd + strlen(cmd);
-            while (end > cmd && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n')) end--;
-            *end = '\0';
-            if (cmd[0]) {
-                if (!strcmp(cmd, "/quit") || !strcmp(cmd, "/exit")) {
-                    running = false;
-                } else if (cmd[0] == '/') {
-                    client_handle_command(c, cmd);
-                } else if (client_worker_idle(c)) {
-                    client_submit_user(c, cmd);
-                } else {
-                    /* Worker is busy: queue the prompt; drain when idle. */
-                    client_prompt_queue_push(&queue, cmd);
-                }
-            }
+            /* Non-TTY: linenoise uses its blocking no-tty readline, which
+             * returns a whole line at once; feed it once per loop pass. */
+            (void)client_feed_editor(&editor, &queue, c, &running);
         }
-        free(line);
     }
     editor_stop(&editor);
     client_prompt_queue_free(&queue);
