@@ -136,6 +136,34 @@ static const char *dbg_tag_name(unsigned char tag) {
     default:                    return "?";
     }
 }
+
+static const char *dbg_status_state_name(uint64_t state) {
+    switch (state) {
+    case AGENT_IDLE:        return "IDLE";
+    case AGENT_PREFILL:     return "PREFILL";
+    case AGENT_GENERATING:  return "GENERATING";
+    case AGENT_COMPACTING:  return "COMPACTING";
+    case AGENT_DRAINING:    return "DRAINING";
+    case AGENT_SAVING:      return "SAVING";
+    case AGENT_ERROR:       return "ERROR";
+    case AGENT_STOPPED:     return "STOPPED";
+    default:                return "?";
+    }
+}
+
+static uint64_t dbg_varint_at(const unsigned char *p, size_t len, size_t *adv) {
+    uint64_t v = 0;
+    int shift = 0;
+    size_t i = 0;
+    while (i < len && i < 10) {
+        unsigned char b = p[i++];
+        v |= (uint64_t)(b & 0x7f) << shift;
+        if (!(b & 0x80)) break;
+        shift += 7;
+    }
+    if (adv) *adv = i;
+    return v;
+}
 #include "ds4_gpu_args.h"
 
 /* Fullwidth vertical bar (UTF-8 EF BF BC) that frames the DSML marker. */
@@ -1626,13 +1654,13 @@ static const char agent_tools_prompt_intro[] =
     "You have access to native DSML tools. Invoke tools by writing exactly this shape:\n\n"
     "<" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "tool_calls>\n"
     "<" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "invoke name=\"$TOOL_NAME\">\n"
-    "<" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE" AGENT_DSML_BAR "parameter>\n"
+    "<" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "parameter>\n"
     "</" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "invoke>\n"
     "</" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "tool_calls>\n\n"
     "Tool calls are not allowed inside <think></think>; finish thinking before emitting DSML.\n\n"
     "String parameters use raw text and string=\"true\". Numbers and booleans use JSON text and string=\"false\".\n\n"
-    "Inside string values only, escape a literal closing parameter tag as &lt;/" AGENT_DSML_BAR "parameter>. "
-    "To write that escaped spelling literally, use &amp;lt;/" AGENT_DSML_BAR "parameter>. Other HTML entities are unchanged.\n\n"
+    "Inside string values only, escape a literal closing parameter tag as &lt;/" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "parameter>. "
+    "To write that escaped spelling literally, use &amp;lt;/" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "parameter>. Other HTML entities are unchanged.\n\n"
     "Read defaults to a context-sized bounded chunk, not the whole file. "
     "For first looks at large files, prefer read with explicit max_lines around 80-160; "
     "if read says more lines are available, call more with count=<lines> to read the next chunk. "
@@ -2595,8 +2623,17 @@ static bool agent_send_all(int fd, const void *buf, size_t len) {
      * stream (that would flood stderr during generation). */
     if (dbg_on && len >= 5 && buf) {
         unsigned char tag = ((const unsigned char *)buf)[4];
-        if (tag != PROTO_S2C_TOKEN)
-            dbg_log('S', "%s -> client (len %zu)", dbg_tag_name(tag), len);
+        if (tag != PROTO_S2C_TOKEN) {
+            if (tag == PROTO_S2C_STATUS && len >= 6) {
+                size_t adv = 0;
+                uint64_t state = dbg_varint_at((const unsigned char *)buf + 5,
+                                               len - 5, &adv);
+                dbg_log('S', "STATUS %s -> client (len %zu)",
+                        dbg_status_state_name(state), len);
+            } else {
+                dbg_log('S', "%s -> client (len %zu)", dbg_tag_name(tag), len);
+            }
+        }
     }
     const unsigned char *p = buf;
     size_t n = 0;
@@ -4008,6 +4045,7 @@ static void worker_set_greedy_sampling(agent_worker *w, bool greedy) {
         w->status.greedy_sampling = greedy;
         w->last_status_push_at = 0.0;
         pthread_mutex_unlock(&w->mu);
+        dbg_log('S', "greedy %s", greedy ? "ON" : "OFF");
         agent_push_status(w, true);
     } else {
         pthread_mutex_unlock(&w->mu);
@@ -4022,7 +4060,7 @@ static const char agent_dsml_syntax_reminder[] =
     "DSML syntax reminder:\n"
     "<" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "tool_calls>\n"
     "<" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "invoke name=\"$TOOL_NAME\">\n"
-    "<" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE" AGENT_DSML_BAR "parameter>\n"
+    "<" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "parameter>\n"
     "</" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "invoke>\n"
     "</" AGENT_DSML_BAR "DSML" AGENT_DSML_BAR "tool_calls>\n";
 
@@ -5462,7 +5500,7 @@ static int server_run(agent_worker *w) {
             break;
         }
         dbg_log('C', "client -> %s (len %zu)",
-                len ? dbg_tag_name(frame[0]) : "?", len);
+                len > 4 ? dbg_tag_name(frame[4]) : "?", len);
         server_dispatch(w, frame, len);
         free(frame);
     }
