@@ -2847,6 +2847,8 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
     return rc;
 }
 
+static void agent_publish_system_status(agent_worker *w, const char *msg);
+
 static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t err_len) {
     agent_worker_images_clear(w);
     ds4_tokens sys = {0};
@@ -2870,6 +2872,8 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
     }
 
     if (!loaded) {
+        if (w->sysprompt_path)
+            agent_publish_system_status(w, "Updating system prompt cache...");
         ds4_tokens_free(&w->transcript);
         ds4_tokens_copy(&w->transcript, &sys);
         if (agent_worker_sync_tokens(w, &w->transcript, true, err, err_len) != 0) {

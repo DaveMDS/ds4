@@ -308,6 +308,10 @@ typedef struct {
     char utf8_pending[4];
     size_t utf8_pending_len;
     size_t utf8_pending_need;
+    char tool_name[64];
+    char param_name[64];
+    bool in_tool;
+    bool read_style;
     agent_buf *out;
 } client_renderer;
 
@@ -587,6 +591,64 @@ static void renderer_write_char(client_renderer *r, char c) {
 
 static void renderer_finish(client_renderer *r) {
     renderer_markdown_finish(r);
+    r->in_tool = false;
+    r->read_style = false;
+    r->param_name[0] = '\0';
+}
+
+static const char *client_tool_prefix(const char *text) {
+    if (!strcmp(text, "bash ")) return "$ ";
+    if (!strcmp(text, "write ")) return "write ";
+    if (!strcmp(text, "edit ")) return "edit ";
+    if (!strcmp(text, "search ")) return "search ";
+    if (!strcmp(text, "google_search ")) return "google ";
+    if (!strcmp(text, "visit_page ")) return "visit ";
+    if (!strcmp(text, "Reading ")) return "Reading ";
+    return NULL;
+}
+
+enum {
+    CLIENT_PARAM_NORMAL,
+    CLIENT_PARAM_PATH,
+    CLIENT_PARAM_OFFSET,
+    CLIENT_PARAM_CONTENT,
+    CLIENT_PARAM_DIFF_OLD,
+    CLIENT_PARAM_DIFF_NEW,
+    CLIENT_PARAM_BASH_COMMAND,
+};
+
+static int client_param_kind_for(const char *tool, const char *param) {
+    if (!tool) tool = "";
+    if (!param) param = "";
+    if (!strcmp(tool, "bash") && !strcmp(param, "command"))
+        return CLIENT_PARAM_BASH_COMMAND;
+    if (!strcmp(tool, "edit") && !strcmp(param, "old"))
+        return CLIENT_PARAM_DIFF_OLD;
+    if (!strcmp(tool, "edit") && !strcmp(param, "new"))
+        return CLIENT_PARAM_DIFF_NEW;
+    if (!strcmp(param, "path") || !strcmp(param, "file") || !strcmp(param, "filename"))
+        return CLIENT_PARAM_PATH;
+    if (!strcmp(param, "line") || !strcmp(param, "start_line") ||
+        !strcmp(param, "end_line") || !strcmp(param, "offset") ||
+        !strcmp(param, "start") || !strcmp(param, "end") ||
+        !strcmp(param, "count") || !strcmp(param, "max_lines") ||
+        !strcmp(param, "timeout_sec") || !strcmp(param, "refresh_sec"))
+        return CLIENT_PARAM_OFFSET;
+    if (!strcmp(param, "content") || !strcmp(param, "text"))
+        return CLIENT_PARAM_CONTENT;
+    return CLIENT_PARAM_NORMAL;
+}
+
+static const char *client_param_color(int kind) {
+    switch (kind) {
+    case CLIENT_PARAM_PATH: return "\x1b[32m";
+    case CLIENT_PARAM_OFFSET: return "\x1b[33m";
+    case CLIENT_PARAM_CONTENT: return "\x1b[34m";
+    case CLIENT_PARAM_DIFF_OLD: return "\x1b[31m";
+    case CLIENT_PARAM_DIFF_NEW: return "\x1b[32m";
+    case CLIENT_PARAM_BASH_COMMAND: return "\x1b[1;36m";
+    default: return "\x1b[37m";
+    }
 }
 
 /* Paint one token by kind (server decides the kind). */
@@ -594,29 +656,80 @@ static void client_render_token(client_renderer *r, unsigned char kind, const ch
     if (!text || !text[0]) return;
     switch (kind) {
     case PROTO_TOKEN_NORMAL:
+        r->in_tool = false;
+        r->read_style = false;
+        r->param_name[0] = '\0';
         for (const char *p = text; *p; p++) renderer_write_char(r, *p);
         break;
     case PROTO_TOKEN_THINK:
+        r->in_tool = false;
+        r->read_style = false;
+        r->param_name[0] = '\0';
         renderer_set_grey(r);
         for (const char *p = text; *p; p++) renderer_write_char_raw(r, *p);
         renderer_reset_color(r);
         break;
     case PROTO_TOKEN_TOOL_NAME:
         if (!r->last_output_newline) renderer_puts(r, "\n");
-        if (r->use_color) renderer_puts(r, "\x1b[1;38;5;39m");
+        if (!r->in_tool) {
+            r->in_tool = true;
+            renderer_puts(r, "🛠️ ");
+            r->read_style = !strcmp(text, "Reading ");
+            const char *prefix = client_tool_prefix(text);
+            size_t n = strlen(text);
+            while (n > 0 && text[n - 1] == ' ') n--;
+            n = n < sizeof(r->tool_name) - 1 ? n : sizeof(r->tool_name) - 1;
+            memcpy(r->tool_name, text, n);
+            r->tool_name[n] = '\0';
+            if (r->read_style) {
+                if (r->use_color) renderer_puts(r, "\x1b[1;37m");
+                renderer_puts(r, "Reading ");
+                if (r->use_color) renderer_puts(r, "\x1b[0m");
+            } else if (!strcmp(r->tool_name, "bash")) {
+                if (r->use_color) renderer_puts(r, "\x1b[1;36m");
+                renderer_puts(r, prefix ? prefix : text);
+                if (r->use_color) renderer_puts(r, "\x1b[0m");
+            } else {
+                if (r->use_color) renderer_puts(r, "\x1b[1;37m");
+                renderer_puts(r, prefix ? prefix : text);
+                if (r->use_color) renderer_puts(r, "\x1b[0m");
+            }
+        } else {
+            if (r->use_color) renderer_puts(r, "\x1b[1;37m");
+            renderer_puts(r, text);
+            if (r->use_color) renderer_puts(r, "\x1b[0m");
+        }
+        break;
+    case PROTO_TOKEN_TOOL_PARAM_NAME: {
+        size_t n = strlen(text);
+        size_t len = n;
+        while (len > 0 && (text[len - 1] == '=' || text[len - 1] == ':' ||
+                           text[len - 1] == '\n'))
+            len--;
+        len = len < sizeof(r->param_name) - 1 ? len : sizeof(r->param_name) - 1;
+        memcpy(r->param_name, text, len);
+        r->param_name[len] = '\0';
+        if (r->use_color) renderer_puts(r, "\x1b[1;37m");
         renderer_puts(r, text);
         if (r->use_color) renderer_puts(r, "\x1b[0m");
         break;
-    case PROTO_TOKEN_TOOL_PARAM_NAME:
-        if (r->use_color) renderer_puts(r, "\x1b[38;5;229m");
+    }
+    case PROTO_TOKEN_TOOL_PARAM_VALUE: {
+        const char *color;
+        if (r->read_style) {
+            color = "\x1b[32m";
+        } else if (!strcmp(r->tool_name, "bash")) {
+            color = "\x1b[1;36m";
+        } else if (!r->param_name[0] && !strcmp(r->tool_name, "write")) {
+            color = "\x1b[34m";
+        } else {
+            color = client_param_color(client_param_kind_for(r->tool_name, r->param_name));
+        }
+        if (r->use_color) renderer_puts(r, color);
         renderer_puts(r, text);
         if (r->use_color) renderer_puts(r, "\x1b[0m");
         break;
-    case PROTO_TOKEN_TOOL_PARAM_VALUE:
-        if (r->use_color) renderer_puts(r, "\x1b[38;5;213m");
-        renderer_puts(r, text);
-        if (r->use_color) renderer_puts(r, "\x1b[0m");
-        break;
+    }
     }
     r->wrote_visible_output = true;
     r->last_output_newline = text[strlen(text) - 1] == '\n';
@@ -1619,6 +1732,131 @@ static void client_trace_text(agent_client *c, const char *label, const char *te
     fputc('\n', c->trace);
 }
 
+/* Shell bytes are data, not instructions to our terminal. Keep only SGR color
+ * sequences; OSC, cursor motion, erasure and other controls stay in the log. */
+static char *client_terminal_safe_text(const char *text, size_t len) {
+    agent_buf out = {0};
+    for (size_t i = 0; i < len;) {
+        unsigned char c = (unsigned char)text[i++];
+        if (c >= 0x80) {
+            uint32_t cp;
+            size_t n = linenoiseUtf8Decode(text + i - 1, len - i + 1, &cp);
+            if (n > 1 && !(cp >= 0x80 && cp <= 0x9f)) {
+                agent_buf_append(&out, text + i - 1, n);
+                i += n - 1;
+                continue;
+            }
+            char escaped[5];
+            snprintf(escaped, sizeof(escaped), "\\x%02x", c);
+            agent_buf_puts(&out, escaped);
+            continue;
+        }
+        if (c == 0x1b) {
+            size_t start = i - 1;
+            if (i == len) break;
+            char kind = text[i++];
+            if (kind == '[') {
+                bool sgr = true;
+                while (i < len && (unsigned char)text[i] < 0x40) {
+                    if (!isdigit((unsigned char)text[i]) && text[i] != ';' && text[i] != ':') sgr = false;
+                    i++;
+                }
+                if (i < len) {
+                    if (text[i] == 'm' && sgr && i - start < 96)
+                        agent_buf_append(&out, text + start, i - start + 1);
+                    i++;
+                }
+            } else if (kind == ']' || kind == 'P' || kind == '_' || kind == '^' || kind == 'X') {
+                while (i < len) {
+                    if (text[i++] == '\a' && kind == ']') break;
+                    if (i >= 2 && text[i - 2] == 0x1b && text[i - 1] == '\\') break;
+                }
+            } else {
+                while (kind >= 0x20 && kind <= 0x2f && i < len) kind = text[i++];
+            }
+            continue;
+        }
+        if ((c < 32 && c != '\n' && c != '\r' && c != '\t') || c == 127) {
+            char escaped[5];
+            snprintf(escaped, sizeof(escaped), "\\x%02x", c);
+            agent_buf_puts(&out, escaped);
+        } else {
+            char ch = (char)c;
+            agent_buf_append(&out, &ch, 1);
+        }
+    }
+    return agent_buf_take(&out);
+}
+
+/* Render a tool observation for the chat like the monolith does: show only
+ * the wrapped output body, dropping the job/metadata lines and the
+ * <output>/<head>/<tail>/<markdown> markers.  The full observation still goes
+ * to the server transcript as TOOL_RESULT. */
+static void client_publish_observation(agent_client *c, const char *obs) {
+    if (!obs || !obs[0]) return;
+    const char *body = NULL;
+    const char *label = strstr(obs, "\n<head ");
+    const char *close = NULL;
+    bool head = false;
+    if (label) {
+        close = "</head>";
+        head = true;
+    } else {
+        label = strstr(obs, "\n<tail ");
+        if (label) close = "</tail>";
+    }
+    if (label) {
+        const char *tag_end = strstr(label, ">\n");
+        if (tag_end) {
+            client_publish(c, "\x1b[90m", 5);
+            client_publish_puts(c, head ? "[showing first output lines]\n"
+                                        : "[showing last output lines]\n");
+            client_publish(c, "\x1b[0m", 4);
+            body = tag_end + 2;
+        }
+    } else {
+        label = strstr(obs, "\n<output>\n");
+        if (label) {
+            body = label + strlen("\n<output>\n");
+            close = "</output>";
+        } else {
+            label = strstr(obs, "\n<markdown>\n");
+            if (label) {
+                body = label + strlen("\n<markdown>\n");
+                close = "</markdown>";
+            }
+        }
+    }
+    if (!body || !body[0]) return;
+    const char *end = close ? strstr(body, close) : NULL;
+    size_t n = end ? (size_t)(end - body) : strlen(body);
+    if (n) {
+        bool failed = strstr(obs, "status=done") && !strstr(obs, "exit_status=0\n");
+        if (failed) client_publish(c, "\x1b[38;5;208m", 11);
+        char *safe = client_terminal_safe_text(body, n);
+        client_publish(c, safe, strlen(safe));
+        if (safe[0] && safe[strlen(safe) - 1] != '\n')
+            client_publish_puts(c, "\n");
+        client_publish(c, "\x1b[0m", 4);
+        free(safe);
+    }
+}
+
+static void client_tools_status(void *ud, const char *msg) {
+    agent_client *c = ud;
+    if (!msg || !msg[0]) return;
+    if (c->renderer.use_color) {
+        static const char marker[] = "\x1b[33m✦ \x1b[38;5;218m";
+        client_publish(c, marker, sizeof(marker) - 1);
+        client_publish_puts(c, msg);
+        client_publish_puts(c, "\x1b[0m\n");
+    } else {
+        client_publish_puts(c, "✦ ");
+        client_publish_puts(c, msg);
+        client_publish_puts(c, "\n");
+    }
+}
+
 /* Execute one tool call and send its result (plus optional ATTACH_IMAGE for
  * view_image). */
 static void client_execute_tool(agent_client *c, proto_tool_call *call) {
@@ -1684,7 +1922,10 @@ static void client_execute_tool(agent_client *c, proto_tool_call *call) {
 
     char *obs = agent_tools_dispatch(&c->tools, call);
     if (obs && obs[0]) {
-        client_publish_puts(c, obs);
+        if (call->name && (!strcmp(call->name, "bash") ||
+                           !strcmp(call->name, "bash_status") ||
+                           !strcmp(call->name, "bash_stop")))
+            client_publish_observation(c, obs);
         /* fit-context: round-trip the observation through TOKENS->COUNT so the
          * server can compact before resuming.  Truncation is left to the server
          * (compaction), so we keep the whole observation. */
@@ -1727,6 +1968,15 @@ static void client_dispatch_s2c(agent_client *c, unsigned char *frame, size_t le
     case PROTO_S2C_STATUS: {
         proto_status_msg m = {0};
         if (!proto_decode_status(frame, len, &tag, &m)) break;
+        if ((m.state == AGENT_IDLE || m.state == AGENT_ERROR) &&
+            c->renderer.wrote_visible_output && !c->renderer.last_output_newline) {
+            pthread_mutex_lock(&c->mu);
+            agent_buf_append(&c->out, "\n", 1);
+            c->wake_pending = true;
+            pthread_cond_signal(&c->cond);
+            pthread_mutex_unlock(&c->mu);
+            c->renderer.last_output_newline = true;
+        }
         client_status_mirror(c, &m);
         free(m.error);
         break;
@@ -2263,6 +2513,8 @@ static void client_init(agent_client *c, const client_config *cfg, int sock_fd) 
     fcntl(c->wake_fd[1], F_SETFL, O_NONBLOCK);
     c->tools.ctx_size = cfg->ctx_size;
     c->tools.io.ask_web = cfg->web;
+    c->tools.io.status = client_tools_status;
+    c->tools.io.ud = c;
     if (cfg->web) {
         ds4_web_config wcfg = {0};
         wcfg.home_dir = getenv("HOME");
