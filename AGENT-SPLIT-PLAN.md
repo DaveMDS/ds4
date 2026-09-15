@@ -13,13 +13,14 @@ progress, Ctrl+C).
 This branch (`agent-split-cc`) is a **fresh, independent** attempt: the work on
 the `agent-split` branch is to be ignored entirely.
 
-**Status:** T1-T13 implemented; three corrections came out of Layer 4 testing
+**Status:** T1-T13 implemented; four corrections came out of Layer 4 testing
 on real hardware (a ROCm Strix Halo host) and are folded into this document —
 see "Server bootstrap / model-loading feedback" in §Architecture and Risks
-20-22. If re-executing this plan from scratch, those sections already reflect
+20-23. If re-executing this plan from scratch, those sections already reflect
 the corrected design; do not reintroduce the sequential engine-open-then-
-listen order, the unbounded STREAM coalescing buffer, or the single-blocking-
-`conn_recv` handshake wait.
+listen order, the unbounded STREAM coalescing buffer, the single-blocking-
+`conn_recv` handshake wait, or a client-side `agent_publish` that writes
+straight to `g_render_sink` without closing an open tool visualisation first.
 
 ## Locked decisions (with the user)
 
@@ -913,7 +914,7 @@ nvcc or a model. **Green fully:** `make` + `make test` on macOS;
 | T7 | Server: `SESSION save/new/switch/list/del/compact` sub-commands (generic replies) — `del` carries the `strip` flag, `switch` on the current sha covers history; `CONFIG get/set` for power/steer/hints. No tokenize RPC. | Layer 3: temp `cache_dir` with fake `.kv` (pattern from `tests/ds4_agent_test.c`) → `SESSION list` reply rows, `/switch` prefix resolution, `/del` + `strip`, title/identity SHA. |
 | T8 | `ds4_agent_client.c` skeleton — `client_parse_options` (`--server`, UI flags, sampling/think/seed/power/steer/hints/`-sys`/`-n` → `SESSION new`) + `-h`/`--help` via new `DS4_HELP_AGENT_CLIENT` in `ds4_help.h`/`ds4_help.c` (additive), socket connect, `HELLO` + reply, print a one-time "model is still loading" notice if `model_loading` is true, `session_parked` branch → `SESSION resume` vs `SESSION new`, store capabilities, error+exit non-zero if the server is unreachable. **The `SESSION new`/`resume` reply wait must loop and dispatch (print) any interleaved `STREAM`/`STATUS` push before the reply arrives — never a single blocking `conn_recv`** (see "Server bootstrap / model-loading feedback" above; this is what makes the loading heartbeat and the existing sysprompt-build notices actually visible, and its absence is a real bug found in Layer 4, not a hypothetical). Target `ds4-agent-client` (Darwin + `cpu:` — no engine) + `.o` rule + `all:`/`cpu:` lists. `tests/ds4_agent_client_test.c` skeleton with a `socketpair` mock server, including a case with `model_loading=true` plus interleaved `STREAM{SYSTEM}` frames before the `SESSION` reply. | Layer 2 bootstrap: mock with `session_parked=false` → well-formed `SESSION new`; `session_parked=true` → `SESSION resume`; capabilities stored; interleaved pushes before the `SESSION`/`SESSION new` reply are printed, not treated as protocol errors. `make cpu` + `make test-cpu` green. |
 | T9 | Client: render stack (`agent_token_renderer`, `agent_syntax`, `renderer_*`, `agent_tool_visualizer`, `agent_tool_viz_*`, `agent_tail_capture`) + `client_apply_stream_fragment`; editor/linenoise/footer/queue/banner/`runtime_help`. Wire `STREAM{NORMAL/THINK/TOOL_*}`→renderer, `STREAM{SYSTEM}`→`✦`, `STREAM{SUMMARY}`→banner+grey, `STATUS`→footer + terminal-state unhide. | Layer 2: the mock feeds scripted `STREAM`/`STATUS` (incl. `SUMMARY`/`SYSTEM` and a `COMPACTING`→`IDLE` sequence); capture client stdout; assert markdown / think-hide / tool-viz bytes and footer text against fixtures ported from `test_unicode_output_and_footer` / `test_markdown_literals` / `test_hint_rendering`. |
-| T10 | Client: all tool execution — `agent_tool_read/more/write/list/edit/search/google_search/visit_page/view_image`, `agent_bash_*`, file helpers, **`agent_edit_find_old_span` exact-only** (§3b), `more_*` cursor, fit-context byte caps on `ctx_size` (no tokenize RPC). Wire `TOOL_CALLS`→execute→`TOOL_RESULT` (text + raw image bytes), `TURN.images[]` population, `DRAIN_REQUEST`→`DRAIN_REPLY` from `agent_prompt_queue` (with `agent_bash_jobs_compaction_observation` prepended if the `DRAIN_REQUEST` follows a successful compaction and there are live jobs), local `agent_web_confirm`. | Layer 2: the mock sends `TOOL_CALLS` (read/edit/bash/list/search/view_image); assert the `TOOL_RESULT` payload, the exact-unique `edit` failure text, bash job lifecycle, fit-context truncation, `TURN.images[]` emission, the bash-jobs reminder in the post-compaction `DRAIN_REPLY`. Reuse `test_atomic_file_tools` / `test_streaming_file_tools` / `test_background_jobs` retargeted. |
+| T10 | Client: all tool execution — `agent_tool_read/more/write/list/edit/search/google_search/visit_page/view_image`, `agent_bash_*`, file helpers, **`agent_edit_find_old_span` exact-only** (§3b), `more_*` cursor, fit-context byte caps on `ctx_size` (no tokenize RPC). Wire `TOOL_CALLS`→execute→`TOOL_RESULT` (text + raw image bytes), `TURN.images[]` population, `DRAIN_REQUEST`→`DRAIN_REPLY` from `agent_prompt_queue` (with `agent_bash_jobs_compaction_observation` prepended if the `DRAIN_REQUEST` follows a successful compaction and there are live jobs), local `agent_web_confirm`. **`agent_publish` (bash job output echo via `agent_bash_publish_observation`, the "unknown tool" notice, etc.) must close any open tool visualisation before writing** (see Risk 23 — get this right the first time: on the client `agent_publish` writes straight to `g_render_sink`, unlike the monolith where it queues into a buffer the single UI thread later drains through the same renderer as the streamed tokens, so the newline bookkeeping was never at risk there). | Layer 2: the mock sends `TOOL_CALLS` (read/edit/bash/list/search/view_image); assert the `TOOL_RESULT` payload, the exact-unique `edit` failure text, bash job lifecycle, fit-context truncation, `TURN.images[]` emission, the bash-jobs reminder in the post-compaction `DRAIN_REPLY`; a case driving a bash `TOOL_NAME`/`PARAM_NAME`/`PARAM_VALUE` sequence then calling `agent_publish` while the tool-viz line is still open, asserting the rendered output never glues the two together (the real "hostnamemax" bug found in Layer 4). Reuse `test_atomic_file_tools` / `test_streaming_file_tools` / `test_background_jobs` retargeted. |
 | T11 | Client: rework `run_agent` + `run_agent_non_interactive` onto the protocol — `TURN`/`INTERRUPT`/`STOP`, `SESSION <subcmd>` for slash commands, `CONFIG` for `/steer`/`/power`/`/hints`, `STATUS`-driven idle tracking, Ctrl+C / Ctrl+X / ESC, queue drain, welcome banner on `/new`, disconnect handling; session-list cache for tab-completion (seed `SESSION list` at startup, refresh after `SESSION save`/`del`/`switch`/`new` replies and `/list` — Risk 15). | Layer 2 e2e: script a full turn (`STATUS{PREFILL}` → `STREAM` → `TOOL_CALLS` → client executes → `STREAM` → terminal `STATUS`); assert the order of client sends (`TURN`, `TOOL_RESULT`, `DRAIN_REPLY`) and the final stdout; script a mid-stream `INTERRUPT`; script `/list` + check the completion cache updates; `/switch` tab-completion from the cache. |
 | T12 | Makefile consistency sweep — `all:` (Darwin) / `cpu:` / `cuda-*` / `strix-halo` lists, `test:` / `test-frontends` / `test-rocm -B` lists, the `test-cpu` phony, `clean:`, `ds4_agent_server_cpu.o` + `ds4_agent_test_cpu.o` + `ds4_test_cpu.o`, `ds4_tool_text.h` dep group. | Local gate: `make cpu` + **`make test-cpu`** green (Layer 1-3 + client Layer-2 e2e + `ds4_agent_test_cpu` / `ds4_test_cpu` sentinels; no engine, no nvcc). |
 | T13 | Docs — `AGENT.md` / `README` note the split binaries + `--server` / `--port` / `--host`, the **"SSH tunnel only" model** and the `--host 0.0.0.0` warning (no auth), the instance lock (Risk 18), reconnect/`SESSION resume`; a `QA_BEFORE_RELEASES.md` entry for the real-inference e2e (ROCm Strix Halo host). | Layer 4 (manual, with the user, **ROCm host** `make strix-halo`): build `sysprompt.kv`, a turn with a tool, a compaction, `/save`+`/switch`, a vision turn, an interrupt at each point A-E, **a reconnect** (kill the client mid-turn → relaunch → `SESSION resume` → session intact at IDLE). |
@@ -1031,6 +1032,24 @@ Layer 4 (ROCm host) — exactly the monolith's own boundary.
     Risk 3's "periodic `STREAM{SYSTEM}`" notices and Risk 20's loading
     heartbeat actually visible instead of a hard "expected SESSION reply,
     got STREAM" failure, which is exactly what a first implementation did.
+23. **Client-side `agent_publish` must close any open tool visualisation
+    before writing.** Found in Layer 4: a bash tool call's own output
+    (`agent_bash_publish_observation` — "[showing first/last output
+    lines]", the raw captured stdout/stderr) rendered glued onto the "$
+    command" line with no separator ("hostnamemax" for `hostname`, "$
+    ls[showing first output lines]" for `ls`) — reproduced with
+    `--non-interactive` too, ruling out linenoise/scroll-region. On the
+    client `agent_publish` writes straight to `g_render_sink` (T9's "no
+    separate UI thread" simplification); unlike the monolith, where
+    `agent_publish` queues into a buffer a single UI thread later drains
+    through the *same* renderer the streamed tokens use, this bypasses
+    `agent_tool_viz_finish`'s newline bookkeeping entirely. **Decided:** a
+    module-level `g_active_stream` (the one live `agent_stream_renderer`,
+    set once in `client_runtime_init` for both interactive and
+    non-interactive mode) that `agent_publish` closes
+    (`client_stream_end_tool`) before every write — get this right in T9/T10
+    from the start rather than copying `agent_publish` as a bare
+    `g_render_sink` passthrough.
 
 ## End-to-end verification
 
@@ -1068,12 +1087,15 @@ Layer 4 (ROCm host) — exactly the monolith's own boundary.
   4. Verify: a turn with a tool call (`read` + `edit`) with **live, token-by-
      token streaming** (not the whole answer appearing at once at the end —
      regression-check the `AGENT_STREAM_FLUSH_INTERVAL_SEC` periodic flush,
-     Risk 21) and visualisation identical to the monolith; prefill/generation
-     footer; a compaction (fill the context) with a banner and a streamed
-     summary; `/save` then `/switch` (with sha tab-completion); a vision turn
-     (`view_image`); Ctrl+C at points A (pre-turn compaction), B (prefill), C
-     (generation), D (tool execution), E (mid-turn compaction) — each time a
-     clean return to IDLE with a well-formed transcript.
+     Risk 21) and visualisation identical to the monolith; **a `bash` tool
+     call whose own output is echoed locally (`agent_bash_publish_observation`)
+     never glues onto the "$ command" line** (Risk 23 — this is what
+     "hostnamemax" looked like); prefill/generation footer; a compaction (fill
+     the context) with a banner and a streamed summary; `/save` then `/switch`
+     (with sha tab-completion); a vision turn (`view_image`); Ctrl+C at points
+     A (pre-turn compaction), B (prefill), C (generation), D (tool execution),
+     E (mid-turn compaction) — each time a clean return to IDLE with a
+     well-formed transcript.
   5. **Reconnect:** kill the client during a turn, relaunch it → the `HELLO`
      reply's `session_parked=true` → `SESSION resume` → the conversation is
      intact, state IDLE, the interrupted turn was closed cleanly.
