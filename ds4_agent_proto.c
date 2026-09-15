@@ -560,6 +560,7 @@ void ap_encode_hello_reply(ap_buf *body, const ap_hello_reply *h) {
     ap_map_put_cstr(&w, "model_name", h->model_name);
     ap_map_put_u32(&w, "vocab_size", h->vocab_size);
     ap_map_put_bool(&w, "session_parked", h->session_parked);
+    ap_map_put_bool(&w, "model_loading", h->model_loading);
     ap_map_end(&w);
 }
 
@@ -577,6 +578,7 @@ bool ap_decode_hello_reply(ap_reader *r, ap_hello_reply *out, char *err, size_t 
     ap_map_get_str(&m, "model_name", out->model_name, sizeof(out->model_name));
     out->vocab_size = ap_map_get_u32(&m, "vocab_size", 0);
     out->session_parked = ap_map_get_bool(&m, "session_parked", false);
+    out->model_loading = ap_map_get_bool(&m, "model_loading", false);
     return true;
 }
 

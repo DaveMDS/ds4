@@ -534,6 +534,10 @@ typedef struct {
     bool stop;
     bool interrupt;
     bool initialized;
+    bool engine_ready;  /* engine attached (agent_worker_attach_engine) or the
+                         * boot permanently failed -- distinct from
+                         * `initialized`, which also requires sysprompt.kv. */
+    bool boot_failed;   /* set only on a permanent engine-open failure */
     bool save_requested;
     bool compact_requested;
     bool power_requested;
@@ -1121,6 +1125,20 @@ static void agent_set_error(agent_worker *w, const char *msg) {
     w->status.state = AGENT_WORKER_ERROR;
     w->status.prefill_tps = 0.0;
     w->status.greedy_sampling = false;
+    snprintf(w->status.error, sizeof(w->status.error), "%s", msg ? msg : "unknown error");
+    agent_wake_locked(w);
+    srv_status_publish_locked(w, true);
+    pthread_mutex_unlock(&w->mu);
+}
+
+/* Permanent engine-open failure during boot (see server_boot_engine_main).
+ * Unblocks anything waiting on engine_ready (HELLO, server_apply_session_new)
+ * without waiting for the full worker_is_initialized timeout. */
+static void agent_worker_mark_boot_failed(agent_worker *w, const char *msg) {
+    pthread_mutex_lock(&w->mu);
+    w->boot_failed = true;
+    w->engine_ready = true;
+    w->status.state = AGENT_WORKER_ERROR;
     snprintf(w->status.error, sizeof(w->status.error), "%s", msg ? msg : "unknown error");
     agent_wake_locked(w);
     srv_status_publish_locked(w, true);
@@ -2098,6 +2116,13 @@ static bool worker_is_initialized(agent_worker *w, agent_status *status) {
     return initialized;
 }
 
+static bool worker_boot_failed(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    bool failed = w->boot_failed;
+    pthread_mutex_unlock(&w->mu);
+    return failed;
+}
+
 /* -- turn loop + compaction live in the T6b/T6c sections below ---- */
 
 static int worker_run_turn(agent_worker *w, const char *user_text);
@@ -2247,10 +2272,13 @@ static void *worker_main(void *arg) {
     return NULL;
 }
 
-static int agent_worker_init(agent_worker *w, ds4_engine *engine,
-                             server_config *cfg, FILE *trace) {
+/* Everything that does NOT depend on an open engine. After this call `w` is a
+ * valid, lockable agent_worker* usable for HELLO replies and the FIFO/push
+ * mechanism (see serve_connection), with w->engine == NULL and
+ * w->engine_ready == false -- the engine is attached later, once loaded, by
+ * agent_worker_attach_engine (see server_boot_engine_main). */
+static int agent_worker_init_base(agent_worker *w, server_config *cfg, FILE *trace) {
     memset(w, 0, sizeof(*w));
-    w->engine = engine;
     w->cfg = cfg;
     w->trace = trace;
     w->wake_fd[0] = -1;
@@ -2263,10 +2291,6 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine,
     int old_flags;
     set_nonblock(w->wake_fd[0], true, &old_flags);
     set_nonblock(w->wake_fd[1], true, &old_flags);
-    if (ds4_session_create(&w->session, engine, cfg->gen.ctx_size) != 0) {
-        fprintf(stderr, "ds4-agent-server: session backend is required\n");
-        return -1;
-    }
     w->cache_dir = agent_default_cache_dir();
     if (!agent_mkdir_p(w->cache_dir)) {
         fprintf(stderr, "ds4-agent-server: failed to create %s: %s\n",
@@ -2274,6 +2298,25 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine,
         return -1;
     }
     w->sysprompt_path = ds4_kvstore_path_join(w->cache_dir, "sysprompt.kv");
+    return 0;
+}
+
+/* The engine-dependent remainder of what used to be agent_worker_init, run
+ * once the engine has finished loading (server_boot_engine_main). w->engine
+ * is written under w->mu because the accept loop (serve_connection) may
+ * already be reading it concurrently for HELLO replies. */
+static int agent_worker_attach_engine(agent_worker *w, ds4_engine *engine) {
+    ds4_session *session = NULL;
+    if (ds4_session_create(&session, engine, w->cfg->gen.ctx_size) != 0) {
+        fprintf(stderr, "ds4-agent-server: session backend is required\n");
+        return -1;
+    }
+    pthread_mutex_lock(&w->mu);
+    w->engine = engine;
+    w->session = session;
+    w->engine_ready = true;
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
     if (pthread_create(&w->thread, NULL, worker_main, w) != 0) return -1;
     return 0;
 }
@@ -3414,10 +3457,12 @@ static bool agent_stream_compaction_needs_lookahead(const srv_stream *s) {
 
 /* engine may be NULL (unit tests): the engine-derived fields stay zeroed. */
 static void server_fill_hello_reply(ap_hello_reply *r, ds4_engine *engine,
-                                    const server_config *cfg, bool parked) {
+                                    const server_config *cfg, bool parked,
+                                    bool model_loading) {
     memset(r, 0, sizeof(*r));
     r->proto_version = AGENT_PROTO_VERSION;
     r->session_parked = parked;
+    r->model_loading = model_loading;
     if (cfg) {
         r->ctx_size_cli = (uint32_t)cfg->gen.ctx_size;
         r->power_percent = cfg->engine.power_percent > 0
@@ -3509,10 +3554,19 @@ static bool server_apply_session_new(agent_worker *w, server_config *cfg,
                                      ap_session_ready *ready,
                                      char *err, size_t errlen) {
     /* The worker builds (or loads) sysprompt.kv on startup; that first prefill
-     * can take a while. Wait for it rather than bouncing the first SESSION new. */
+     * can take a while, and for the first client to connect while the server
+     * is still booting this wait also covers the model load itself (see
+     * server_boot_engine_main). Wait for it rather than bouncing the first
+     * SESSION new -- but fail fast on a permanent boot failure instead of
+     * waiting out the full budget. */
     for (int i = 0; !worker_is_initialized(w, NULL) && i < 6000; i++) {
+        if (worker_boot_failed(w)) break;
         struct timespec d = {0, 50000000L}; /* 50 ms, up to ~5 min total */
         nanosleep(&d, NULL);
+    }
+    if (worker_boot_failed(w)) {
+        snprintf(err, errlen, "the model failed to load");
+        return false;
     }
     if (!worker_is_initialized(w, NULL)) {
         snprintf(err, errlen, "worker did not finish starting up");
@@ -6692,9 +6746,14 @@ static serve_result serve_connection(server_conn *co, agent_worker *w,
             conn_send_reply_err(co, AGENT_MSG_HELLO, "busy");
             goto done;
         }
+        pthread_mutex_lock(&w->mu);
+        bool loading = !w->engine_ready;
+        ds4_engine *eng = w->engine;
+        pthread_mutex_unlock(&w->mu);
+
         ap_hello_reply reply;
-        server_fill_hello_reply(&reply, w->engine, cfg,
-                                sess->state == SERVER_SESSION_PARKED);
+        server_fill_hello_reply(&reply, eng, cfg,
+                                sess->state == SERVER_SESSION_PARKED, loading);
         ap_buf body;
         ap_buf_init(&body);
         ap_encode_hello_reply(&body, &reply);
@@ -6749,12 +6808,18 @@ done:
 static volatile sig_atomic_t g_shutdown = 0;
 static int g_listen_fd = -1;
 
-static void server_sigint_handler(int sig) {
-    (void)sig;
+/* Shared by SIGINT and a permanent boot failure (server_boot_engine_main):
+ * both need the listener and any active connection torn down the same way. */
+static void server_request_shutdown(void) {
     g_shutdown = 1;
     if (g_listen_fd >= 0) close(g_listen_fd);
     g_listen_fd = -1;
     if (g_active_conn_fd >= 0) shutdown(g_active_conn_fd, SHUT_RDWR);
+}
+
+static void server_sigint_handler(int sig) {
+    (void)sig;
+    server_request_shutdown();
 }
 
 static int server_listen(const char *host, int port) {
@@ -6795,7 +6860,84 @@ static int server_listen(const char *host, int port) {
     return fd;
 }
 
-static int run_server(ds4_engine *engine, server_config *cfg) {
+/* ========================================================================= */
+/* Boot: listener first, engine load in the background.                      */
+/*                                                                            */
+/* server_open_engine() is a single blocking call into ds4.c with no yield   */
+/* points and is not touched here. To let the client connect and see        */
+/* something while it runs, the listener/accept loop starts first and a     */
+/* small heartbeat thread pushes periodic STREAM{SYSTEM} notices while a     */
+/* separate boot thread does the actual (blocking) engine load.              */
+/* ========================================================================= */
+
+#define AGENT_LOADING_HEARTBEAT_INTERVAL_SEC 2.0
+
+typedef struct {
+    agent_worker *w;
+    volatile sig_atomic_t stop;
+} server_heartbeat_ctx;
+
+static void *server_loading_heartbeat_main(void *arg) {
+    server_heartbeat_ctx *hc = arg;
+    double started_at = now_sec();
+    while (!hc->stop) {
+        struct timespec d = {0, 100000000L}; /* 100 ms poll for a prompt stop */
+        nanosleep(&d, NULL);
+        if (hc->stop) break;
+        double elapsed = now_sec() - started_at;
+        if (elapsed + 1e-9 < AGENT_LOADING_HEARTBEAT_INTERVAL_SEC) continue;
+        started_at = now_sec();
+        char msg[64];
+        snprintf(msg, sizeof(msg), "Loading model... (%ds elapsed)", (int)elapsed);
+        agent_publish_system_status(hc->w, msg);
+    }
+    return NULL;
+}
+
+typedef struct {
+    server_config *cfg;
+    agent_worker *w;
+    ds4_engine *engine;
+    ds4_tp *tp_leader;
+    int rc;
+} server_boot_ctx;
+
+static void *server_boot_engine_main(void *arg) {
+    server_boot_ctx *bc = arg;
+
+    server_heartbeat_ctx hc = { .w = bc->w, .stop = 0 };
+    pthread_t ht;
+    bool ht_ok = pthread_create(&ht, NULL, server_loading_heartbeat_main, &hc) == 0;
+
+    bc->rc = server_open_engine(bc->cfg, &bc->engine, &bc->tp_leader);
+
+    hc.stop = 1;
+    if (ht_ok) pthread_join(ht, NULL);
+
+    if (bc->rc != 0) {
+        agent_worker_mark_boot_failed(bc->w, "failed to load the model");
+        agent_publish_system_status(bc->w,
+            "Model failed to load; shutting down.");
+        server_request_shutdown();
+        return NULL;
+    }
+
+    if (agent_worker_attach_engine(bc->w, bc->engine) != 0) {
+        agent_worker_mark_boot_failed(bc->w, "failed to start the worker");
+        agent_publish_system_status(bc->w,
+            "Worker failed to start; shutting down.");
+        server_request_shutdown();
+        bc->rc = 1;
+        return NULL;
+    }
+
+    return NULL;
+}
+
+static int run_server(server_config *cfg, ds4_engine **engine_out, ds4_tp **tp_out) {
+    *engine_out = NULL;
+    *tp_out = NULL;
+
     FILE *trace = NULL;
     if (cfg->trace_path) {
         trace = fopen(cfg->trace_path, "w");
@@ -6812,16 +6954,33 @@ static int run_server(ds4_engine *engine, server_config *cfg) {
 
     /* One worker for the life of the process: it owns the engine session, the
      * transcript and sysprompt.kv, and survives client disconnects (the parked
-     * session). It builds sysprompt.kv on startup, like the monolith. */
+     * session). It builds sysprompt.kv on startup, like the monolith. The
+     * engine itself is not open yet -- a background boot thread loads it
+     * (server_boot_engine_main) while the accept loop below already runs, so
+     * a client can connect and see loading progress instead of finding the
+     * port closed. */
     agent_worker worker;
-    if (agent_worker_init(&worker, engine, cfg, trace) != 0) {
+    if (agent_worker_init_base(&worker, cfg, trace) != 0) {
         fprintf(stderr, "ds4-agent-server: failed to start worker\n");
         agent_worker_free(&worker);
         if (g_listen_fd >= 0) { close(g_listen_fd); g_listen_fd = -1; }
         if (trace) fclose(trace);
         return 1;
     }
-    fprintf(stderr, "ds4-agent-server: listening on %s:%d\n", cfg->host, cfg->port);
+    fprintf(stderr, "ds4-agent-server: listening on %s:%d (loading model...)\n",
+            cfg->host, cfg->port);
+
+    server_boot_ctx boot = { .cfg = cfg, .w = &worker, .engine = NULL,
+                             .tp_leader = NULL, .rc = 0 };
+    pthread_t boot_thread;
+    bool boot_ok = pthread_create(&boot_thread, NULL, server_boot_engine_main, &boot) == 0;
+    if (!boot_ok) {
+        fprintf(stderr, "ds4-agent-server: failed to start boot thread\n");
+        agent_worker_free(&worker);
+        if (g_listen_fd >= 0) { close(g_listen_fd); g_listen_fd = -1; }
+        if (trace) fclose(trace);
+        return 1;
+    }
 
     server_session sess;
     server_session_clear(&sess);
@@ -6858,9 +7017,19 @@ static int run_server(ds4_engine *engine, server_config *cfg) {
     }
 
     server_session_shutdown(&sess);
+    /* Must join before agent_worker_free (which destroys w->mu/w->cond) --
+     * the boot thread may still be blocked in the uninterruptible
+     * server_open_engine() call (no cancellation point exists in ds4.c). A
+     * long model load in progress means SIGINT/a boot failure closes the
+     * listener/connection immediately but the process itself only exits once
+     * that call returns on its own. */
+    pthread_join(boot_thread, NULL);
+    if (rc == 0 && boot.rc != 0) rc = boot.rc;
     agent_worker_free(&worker);
     if (g_listen_fd >= 0) { close(g_listen_fd); g_listen_fd = -1; }
     if (trace) fclose(trace);
+    *engine_out = boot.engine;
+    *tp_out = boot.tp_leader;
     return rc;
 }
 
@@ -6872,11 +7041,6 @@ static int run_server(ds4_engine *engine, server_config *cfg) {
 int main(int argc, char **argv) {
     server_config cfg = server_parse_options(argc, argv);
 
-    ds4_engine *engine = NULL;
-    ds4_tp *tp_leader = NULL;
-    int rc = server_open_engine(&cfg, &engine, &tp_leader);
-    if (rc != 0) return rc;
-
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sigemptyset(&sa.sa_mask);
@@ -6885,7 +7049,9 @@ int main(int argc, char **argv) {
     bool sigint_installed = sigaction(SIGINT, &sa, &old_int) == 0;
     signal(SIGPIPE, SIG_IGN);
 
-    rc = run_server(engine, &cfg);
+    ds4_engine *engine = NULL;
+    ds4_tp *tp_leader = NULL;
+    int rc = run_server(&cfg, &engine, &tp_leader);
 
     if (sigint_installed) sigaction(SIGINT, &old_int, NULL);
     if (tp_leader) ds4_tp_send_stop(tp_leader);

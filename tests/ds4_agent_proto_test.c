@@ -545,6 +545,7 @@ static void test_hello_reply_and_err_path(void) {
     snprintf(hr.model_name, sizeof(hr.model_name), "DeepSeek-V4-Flash");
     hr.vocab_size = 129280;
     hr.session_parked = true;
+    hr.model_loading = true;
 
     ap_buf body;
     ap_buf_init(&body);
@@ -566,6 +567,7 @@ static void test_hello_reply_and_err_path(void) {
     CHECK(got.power_percent == 80 && got.mtp_draft_tokens == 3);
     CHECK(strcmp(got.model_name, "DeepSeek-V4-Flash") == 0);
     CHECK(got.vocab_size == 129280 && got.session_parked);
+    CHECK(got.model_loading);
     ap_buf_free(&body);
     ap_buf_free(&payload);
 

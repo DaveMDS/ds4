@@ -94,20 +94,30 @@ static void test_hello_reply_fill(void) {
     c.engine.power_percent = 0;
 
     ap_hello_reply r;
-    server_fill_hello_reply(&r, NULL, &c, false);
+    server_fill_hello_reply(&r, NULL, &c, false, false);
     CHECK(r.proto_version == AGENT_PROTO_VERSION);
     CHECK(r.ctx_size_cli == 32768);
     CHECK(r.power_percent == 100); /* unset -> 100 */
     CHECK(r.session_parked == false);
+    CHECK(r.model_loading == false);
     CHECK(strlen(r.backend_name) > 0);
     CHECK(r.vocab_size == 0 && r.model_name[0] == '\0'); /* no engine */
 
     c.engine.power_percent = 42;
-    server_fill_hello_reply(&r, NULL, &c, true);
+    server_fill_hello_reply(&r, NULL, &c, true, false);
     CHECK(r.power_percent == 42);
     CHECK(r.session_parked == true);
 
+    /* still loading: engine-derived fields stay zeroed regardless of a real
+     * engine being passed, since the caller is expected to pass NULL/false
+     * consistently -- here we just check the flag round-trips on its own. */
+    server_fill_hello_reply(&r, NULL, &c, false, true);
+    CHECK(r.model_loading == true);
+    CHECK(r.vocab_size == 0 && r.model_name[0] == '\0');
+
     /* survives a proto round trip */
+    c.engine.power_percent = 42;
+    server_fill_hello_reply(&r, NULL, &c, true, false);
     ap_buf body;
     ap_buf_init(&body);
     ap_encode_hello_reply(&body, &r);
@@ -117,6 +127,7 @@ static void test_hello_reply_fill(void) {
     char err[128] = { 0 };
     CHECK(ap_decode_hello_reply(&rd, &got, err, sizeof(err)));
     CHECK(got.power_percent == 42 && got.session_parked && got.ctx_size_cli == 32768);
+    CHECK(got.model_loading == false);
     ap_buf_free(&body);
 }
 
@@ -440,6 +451,24 @@ static size_t fifo_count(const agent_worker *w) {
     size_t n = 0;
     for (const srv_msg *m = w->fifo_head; m; m = m->next) n++;
     return n;
+}
+
+/* A permanent boot failure (server_boot_engine_main) must unblock anything
+ * waiting on engine_ready without needing real threads or an engine. */
+static void test_worker_mark_boot_failed(void) {
+    agent_worker w;
+    fake_worker(&w);
+    w.initialized = false;
+    w.engine_ready = false;
+
+    agent_worker_mark_boot_failed(&w, "boom");
+    CHECK(w.boot_failed == true);
+    CHECK(w.engine_ready == true);
+    CHECK(w.status.state == AGENT_WORKER_ERROR);
+    CHECK(strstr(w.status.error, "boom") != NULL);
+    CHECK(worker_boot_failed(&w) == true);
+
+    fake_worker_destroy(&w);
 }
 
 static void test_srv_status_packing(void) {
@@ -998,6 +1027,7 @@ int main(void) {
     test_parse_server_endpoint();
     test_parse_backend_names();
     test_hello_reply_fill();
+    test_worker_mark_boot_failed();
     test_session_state_machine();
     test_tools_prompt_exact_only();
     test_compact_make_prompt();

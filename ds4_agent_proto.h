@@ -42,7 +42,7 @@
 #include <stdint.h>
 
 #define AGENT_PROTO_MAGIC      0x44533441u /* "DS4A" */
-#define AGENT_PROTO_VERSION    1u
+#define AGENT_PROTO_VERSION    2u
 #define AGENT_PROTO_HEADER_LEN 12u
 #define AGENT_PROTO_MAX_FRAME  (32u * 1024u * 1024u)
 
@@ -307,6 +307,7 @@ typedef struct {
     char model_name[AP_CAP_MODEL];
     uint32_t vocab_size;
     bool session_parked;
+    bool model_loading; /* engine not attached yet: the fields above are zeroed */
 } ap_hello_reply;
 
 void ap_encode_hello_reply(ap_buf *body, const ap_hello_reply *h);

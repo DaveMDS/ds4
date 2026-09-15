@@ -2208,14 +2208,13 @@ static bool client_handshake(client_conn *co, const client_config *cfg,
         }
     }
 
-    /* 3. SESSION resume (parked) or SESSION new; fall back to new if resume
-     *    is rejected. Building/loading sysprompt.kv (agent_worker_reset_to_
-     *    sysprompt) can push STREAM{SYSTEM} notices ("Updating system prompt
-     *    cache...", "Distributed route ready.") on this same connection
-     *    before the SESSION reply -- print them like client_dispatch_push
-     *    would once the runtime exists (Risk 3). A minimal renderer is built
-     *    here since client_runtime isn't constructed until after the
-     *    handshake; g_render_sink is still plain stdout at this point. */
+    /* Building/loading sysprompt.kv (agent_worker_reset_to_sysprompt), and now
+     * also the model load itself, can push STREAM{SYSTEM} notices ("Loading
+     * model... (Ns elapsed)", "Updating system prompt cache...", "Distributed
+     * route ready.") on this same connection before the SESSION reply -- print
+     * them like client_dispatch_push would once the runtime exists (Risk 3).
+     * A minimal renderer is built here since client_runtime isn't constructed
+     * until after the handshake; g_render_sink is still plain stdout here. */
     agent_token_renderer handshake_rndr;
     memset(&handshake_rndr, 0, sizeof(handshake_rndr));
     handshake_rndr.use_color = isatty(STDOUT_FILENO) != 0;
@@ -2223,6 +2222,15 @@ static bool client_handshake(client_conn *co, const client_config *cfg,
     agent_stream_renderer handshake_sr = {0};
     handshake_sr.renderer = &handshake_rndr;
 
+    if (sess->caps.model_loading) {
+        const char *msg = "Connected. The model is still loading on the "
+            "server -- this can take a while for a large model.";
+        client_apply_stream_fragment(&handshake_sr, AGENT_STREAM_SYSTEM,
+                                     msg, strlen(msg));
+    }
+
+    /* 3. SESSION resume (parked) or SESSION new; fall back to new if resume
+     *    is rejected. */
     bool want_resume = sess->caps.session_parked;
     for (int attempt = 0; attempt < 2; attempt++) {
         if (!client_send_session(co, cfg, want_resume)) {

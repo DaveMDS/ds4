@@ -69,6 +69,70 @@ static ap_session_ready make_ready(void) {
     return s;
 }
 
+/* If the server accepted the connection while the model is still loading
+ * (HELLO reply model_loading=true), periodic STREAM{SYSTEM} "Loading
+ * model..." heartbeats can arrive before the SESSION new reply -- the
+ * handshake must tolerate them exactly like the sysprompt-build notices
+ * (test_handshake tolerance already covers STREAM/STATUS generically; this
+ * asserts the new model_loading field itself round-trips into client_session
+ * and that the handshake still succeeds with two such notices in between). */
+static void test_handshake_model_loading(void) {
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+
+    {
+        ap_hello_reply caps = make_caps(false);
+        caps.model_loading = true;
+        ap_buf b; ap_buf_init(&b);
+        ap_encode_hello_reply(&b, &caps);
+        mock_send(sv[1], AGENT_MSG_HELLO, &b);
+        ap_buf_free(&b);
+
+        const char *notices[] = {
+            "Loading model... (2s elapsed)",
+            "Loading model... (4s elapsed)",
+        };
+        for (size_t i = 0; i < 2; i++) {
+            ap_stream s = { .kind = AGENT_STREAM_SYSTEM, .text = notices[i],
+                            .text_len = strlen(notices[i]) };
+            ap_buf_init(&b);
+            ap_encode_stream(&b, &s);
+            mock_send(sv[1], AGENT_MSG_STREAM, &b);
+            ap_buf_free(&b);
+        }
+
+        ap_session_ready rd = make_ready();
+        ap_buf_init(&b);
+        ap_encode_session_ready(&b, &rd);
+        mock_send(sv[1], AGENT_MSG_SESSION, &b);
+        ap_buf_free(&b);
+    }
+
+    client_config cfg = {
+        .server_port = 7878,
+        .system = "sys text",
+        .n_predict = 4096,
+        .temperature = 0.7f, .temperature_set = true,
+        .top_p = DS4_DEFAULT_TOP_P, .min_p = DS4_DEFAULT_MIN_P,
+        .think_mode = DS4_THINK_HIGH,
+        .hints_enabled = true,
+    };
+    snprintf(cfg.server_host, sizeof(cfg.server_host), "127.0.0.1");
+
+    client_conn co;
+    conn_init(&co, sv[0], NULL);
+
+    client_session sess;
+    char err[256] = {0};
+    CHECK(client_handshake(&co, &cfg, &sess, err, sizeof(err)));
+    CHECK(err[0] == '\0');
+    CHECK(sess.caps.model_loading == true);
+    CHECK(sess.ready.ctx_size == 98304); /* the SESSION reply still arrived intact */
+
+    conn_free(&co); /* closes sv[0] */
+    close(sv[1]);
+}
+
 static void test_handshake_new_session(void) {
     int sv[2];
     CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -1570,6 +1634,7 @@ static void test_non_interactive_one_shot_e2e(void) {
 }
 
 int main(void) {
+    test_handshake_model_loading();
     test_handshake_new_session();
     test_handshake_resume();
     test_handshake_resume_falls_back_to_new();
