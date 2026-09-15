@@ -440,102 +440,9 @@ static bool client_send_session(client_conn *co, const client_config *cfg,
     return ok;
 }
 
-/* Returns false with err set on any failure. On success *sess is filled. */
-static bool client_handshake(client_conn *co, const client_config *cfg,
-                             client_session *sess, char *err, size_t errlen) {
-    memset(sess, 0, sizeof(*sess));
-
-    /* 1. HELLO. */
-    {
-        char cwd[AP_CAP_PATH];
-        if (!getcwd(cwd, sizeof(cwd))) cwd[0] = '\0';
-        ap_hello h;
-        memset(&h, 0, sizeof(h));
-        h.proto_version = AGENT_PROTO_VERSION;
-        snprintf(h.client_version, sizeof(h.client_version), "ds4-agent-client/%u",
-                 (unsigned)AGENT_PROTO_VERSION);
-        snprintf(h.cwd, sizeof(h.cwd), "%s", cwd);
-        ap_buf body;
-        ap_buf_init(&body);
-        ap_encode_hello(&body, &h);
-        bool ok = conn_send(co, AGENT_MSG_HELLO, &body);
-        ap_buf_free(&body);
-        if (!ok) { snprintf(err, errlen, "failed to send HELLO"); return false; }
-    }
-
-    /* 2. HELLO reply. */
-    {
-        uint32_t type = 0;
-        ap_buf payload;
-        ap_buf_init(&payload);
-        conn_frame_result fr = conn_recv(co, &type, &payload, err, errlen);
-        if (fr == CONN_FRAME_CLOSED) {
-            snprintf(err, errlen, "server closed the connection during HELLO");
-            ap_buf_free(&payload);
-            return false;
-        }
-        if (fr == CONN_FRAME_ERROR) { ap_buf_free(&payload); return false; }
-        if (type != AGENT_MSG_HELLO) {
-            snprintf(err, errlen, "expected HELLO reply, got %s", ap_msg_name(type));
-            ap_buf_free(&payload);
-            return false;
-        }
-        ap_reader r;
-        ap_reader_init(&r, payload.data, payload.len);
-        bool ok = ap_decode_hello_reply(&r, &sess->caps, err, errlen);
-        ap_buf_free(&payload);
-        if (!ok) return false; /* server ERR (version mismatch / busy) -> err set */
-        if (sess->caps.proto_version != AGENT_PROTO_VERSION) {
-            snprintf(err, errlen,
-                     "protocol mismatch (client %u, server %u): rebuild both binaries",
-                     (unsigned)AGENT_PROTO_VERSION,
-                     (unsigned)sess->caps.proto_version);
-            return false;
-        }
-    }
-
-    /* 3. SESSION resume (parked) or SESSION new; fall back to new if resume
-     *    is rejected. */
-    bool want_resume = sess->caps.session_parked;
-    for (int attempt = 0; attempt < 2; attempt++) {
-        if (!client_send_session(co, cfg, want_resume)) {
-            snprintf(err, errlen, "failed to send SESSION %s",
-                     want_resume ? "resume" : "new");
-            return false;
-        }
-        uint32_t type = 0;
-        ap_buf payload;
-        ap_buf_init(&payload);
-        conn_frame_result fr = conn_recv(co, &type, &payload, err, errlen);
-        if (fr == CONN_FRAME_CLOSED) {
-            snprintf(err, errlen, "server closed the connection during SESSION setup");
-            ap_buf_free(&payload);
-            return false;
-        }
-        if (fr == CONN_FRAME_ERROR) { ap_buf_free(&payload); return false; }
-        if (type != AGENT_MSG_SESSION) {
-            snprintf(err, errlen, "expected SESSION reply, got %s", ap_msg_name(type));
-            ap_buf_free(&payload);
-            return false;
-        }
-        ap_reader r;
-        ap_reader_init(&r, payload.data, payload.len);
-        char serr[AP_CAP_ERROR] = {0};
-        bool ok = ap_decode_session_ready(&r, &sess->ready, serr, sizeof(serr));
-        ap_buf_free(&payload);
-        if (ok) {
-            sess->resumed = want_resume;
-            return true;
-        }
-        if (want_resume && attempt == 0) {
-            want_resume = false; /* parked session gone: start fresh */
-            continue;
-        }
-        snprintf(err, errlen, "%s", serr[0] ? serr : "SESSION setup failed");
-        return false;
-    }
-    return false; /* unreachable */
-}
+/* client_handshake is defined further down, after agent_stream_renderer /
+ * client_apply_stream_fragment (it needs them to print STREAM{SYSTEM}
+ * notices that can arrive before the SESSION reply -- see its definition). */
 
 /* ========================================================================= */
 /* T9: client render stack.                                                   */
@@ -2245,6 +2152,137 @@ static void client_apply_stream_fragment(agent_stream_renderer *sr,
     default:
         break;
     }
+}
+
+/* Returns false with err set on any failure. On success *sess is filled. */
+static bool client_handshake(client_conn *co, const client_config *cfg,
+                             client_session *sess, char *err, size_t errlen) {
+    memset(sess, 0, sizeof(*sess));
+
+    /* 1. HELLO. */
+    {
+        char cwd[AP_CAP_PATH];
+        if (!getcwd(cwd, sizeof(cwd))) cwd[0] = '\0';
+        ap_hello h;
+        memset(&h, 0, sizeof(h));
+        h.proto_version = AGENT_PROTO_VERSION;
+        snprintf(h.client_version, sizeof(h.client_version), "ds4-agent-client/%u",
+                 (unsigned)AGENT_PROTO_VERSION);
+        snprintf(h.cwd, sizeof(h.cwd), "%s", cwd);
+        ap_buf body;
+        ap_buf_init(&body);
+        ap_encode_hello(&body, &h);
+        bool ok = conn_send(co, AGENT_MSG_HELLO, &body);
+        ap_buf_free(&body);
+        if (!ok) { snprintf(err, errlen, "failed to send HELLO"); return false; }
+    }
+
+    /* 2. HELLO reply. */
+    {
+        uint32_t type = 0;
+        ap_buf payload;
+        ap_buf_init(&payload);
+        conn_frame_result fr = conn_recv(co, &type, &payload, err, errlen);
+        if (fr == CONN_FRAME_CLOSED) {
+            snprintf(err, errlen, "server closed the connection during HELLO");
+            ap_buf_free(&payload);
+            return false;
+        }
+        if (fr == CONN_FRAME_ERROR) { ap_buf_free(&payload); return false; }
+        if (type != AGENT_MSG_HELLO) {
+            snprintf(err, errlen, "expected HELLO reply, got %s", ap_msg_name(type));
+            ap_buf_free(&payload);
+            return false;
+        }
+        ap_reader r;
+        ap_reader_init(&r, payload.data, payload.len);
+        bool ok = ap_decode_hello_reply(&r, &sess->caps, err, errlen);
+        ap_buf_free(&payload);
+        if (!ok) return false; /* server ERR (version mismatch / busy) -> err set */
+        if (sess->caps.proto_version != AGENT_PROTO_VERSION) {
+            snprintf(err, errlen,
+                     "protocol mismatch (client %u, server %u): rebuild both binaries",
+                     (unsigned)AGENT_PROTO_VERSION,
+                     (unsigned)sess->caps.proto_version);
+            return false;
+        }
+    }
+
+    /* 3. SESSION resume (parked) or SESSION new; fall back to new if resume
+     *    is rejected. Building/loading sysprompt.kv (agent_worker_reset_to_
+     *    sysprompt) can push STREAM{SYSTEM} notices ("Updating system prompt
+     *    cache...", "Distributed route ready.") on this same connection
+     *    before the SESSION reply -- print them like client_dispatch_push
+     *    would once the runtime exists (Risk 3). A minimal renderer is built
+     *    here since client_runtime isn't constructed until after the
+     *    handshake; g_render_sink is still plain stdout at this point. */
+    agent_token_renderer handshake_rndr;
+    memset(&handshake_rndr, 0, sizeof(handshake_rndr));
+    handshake_rndr.use_color = isatty(STDOUT_FILENO) != 0;
+    handshake_rndr.last_output_newline = true;
+    agent_stream_renderer handshake_sr = {0};
+    handshake_sr.renderer = &handshake_rndr;
+
+    bool want_resume = sess->caps.session_parked;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (!client_send_session(co, cfg, want_resume)) {
+            snprintf(err, errlen, "failed to send SESSION %s",
+                     want_resume ? "resume" : "new");
+            return false;
+        }
+        uint32_t type = 0;
+        ap_buf payload;
+        ap_buf_init(&payload);
+        conn_frame_result fr;
+        for (;;) {
+            fr = conn_recv(co, &type, &payload, err, errlen);
+            if (fr != CONN_FRAME_OK) break;
+            if (type == AGENT_MSG_STREAM) {
+                ap_stream s;
+                ap_reader sr;
+                ap_reader_init(&sr, payload.data, payload.len);
+                if (ap_decode_stream(&sr, &s))
+                    client_apply_stream_fragment(&handshake_sr, s.kind, s.text,
+                                                 s.text_len);
+                ap_buf_free(&payload);
+                ap_buf_init(&payload);
+                continue;
+            }
+            if (type == AGENT_MSG_STATUS) {
+                ap_buf_free(&payload);
+                ap_buf_init(&payload);
+                continue;
+            }
+            break;
+        }
+        if (fr == CONN_FRAME_CLOSED) {
+            snprintf(err, errlen, "server closed the connection during SESSION setup");
+            ap_buf_free(&payload);
+            return false;
+        }
+        if (fr == CONN_FRAME_ERROR) { ap_buf_free(&payload); return false; }
+        if (type != AGENT_MSG_SESSION) {
+            snprintf(err, errlen, "expected SESSION reply, got %s", ap_msg_name(type));
+            ap_buf_free(&payload);
+            return false;
+        }
+        ap_reader r;
+        ap_reader_init(&r, payload.data, payload.len);
+        char serr[AP_CAP_ERROR] = {0};
+        bool ok = ap_decode_session_ready(&r, &sess->ready, serr, sizeof(serr));
+        ap_buf_free(&payload);
+        if (ok) {
+            sess->resumed = want_resume;
+            return true;
+        }
+        if (want_resume && attempt == 0) {
+            want_resume = false; /* parked session gone: start fresh */
+            continue;
+        }
+        snprintf(err, errlen, "%s", serr[0] ? serr : "SESSION setup failed");
+        return false;
+    }
+    return false; /* unreachable */
 }
 
 /* Called on a terminal STATUS reached from PREFILL / GENERATING / COMPACTING. */
