@@ -2970,6 +2970,12 @@ typedef struct {
     size_t ccap;
     uint32_t stream_id;
     bool at_newline;        /* last emitted byte was '\n' (for notice framing) */
+    double last_flush;      /* now_sec() of the last flush; 0.0 forces one on
+                              * first use. A long run of the same kind (plain
+                              * NORMAL/THINK text is the common case) would
+                              * otherwise only flush on a kind change or at
+                              * finish=true, i.e. once at the very end of the
+                              * turn -- see AGENT_STREAM_FLUSH_INTERVAL_SEC. */
 
     /* <think>/</think> stripping (consumed here, never sent) */
     bool in_think;
@@ -2998,7 +3004,14 @@ typedef struct {
     size_t param_end_len;
 } srv_stream;
 
+/* Same-kind runs (plain NORMAL/THINK text is the common case) must not sit in
+ * the coalescing buffer for the whole turn: a token every ~30-80ms is typical
+ * generation speed, so 100ms keeps the client visibly live without giving up
+ * the coalescing benefit for faster bursts (tool-call fragment bytes). */
+#define AGENT_STREAM_FLUSH_INTERVAL_SEC 0.1
+
 static void srv_stream_flush(srv_stream *s) {
+    s->last_flush = now_sec();
     if (s->cur_kind < 0 || s->clen == 0) {
         s->cur_kind = -1;
         s->clen = 0;
@@ -3009,6 +3022,17 @@ static void srv_stream_flush(srv_stream *s) {
                 s->cbuf, s->clen);
     s->clen = 0;
     s->cur_kind = -1;
+}
+
+/* Force a flush of whatever is pending if AGENT_STREAM_FLUSH_INTERVAL_SEC has
+ * elapsed since the last one, regardless of s->cur_kind -- the periodic
+ * counterpart to the kind-change flush in srv_emit / the finish flush in
+ * srv_stream_text. Called once per srv_stream_text() call (i.e. per
+ * generated token), not per byte. */
+static void srv_stream_flush_if_due(srv_stream *s) {
+    if (s->cur_kind < 0 || s->clen == 0) return;
+    if (now_sec() - s->last_flush >= AGENT_STREAM_FLUSH_INTERVAL_SEC)
+        srv_stream_flush(s);
 }
 
 static void srv_emit(srv_stream *s, int kind, const char *text, size_t len) {
@@ -3312,6 +3336,8 @@ static void srv_stream_text(srv_stream *s, const char *text, size_t len,
     }
     free(buf);
 
+    if (!finish) srv_stream_flush_if_due(s);
+
     if (finish) {
         srv_stream_flush_start_tail(s);
         s->post_think_gap = false;
@@ -3352,6 +3378,8 @@ static void srv_stream_init(srv_stream *s, agent_dsml_parser *parser,
     s->emit_ud = emit_ud;
     s->cur_kind = -1;
     s->at_newline = true;
+    s->last_flush = now_sec(); /* not 0.0: the periodic flush interval must
+                                 * count from stream start, not the epoch. */
 }
 
 static void srv_stream_free(srv_stream *s) {

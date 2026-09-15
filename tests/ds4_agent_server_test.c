@@ -341,6 +341,43 @@ static void test_stream_normal_coalesced(void) {
     cap_free(&c);
 }
 
+/* A same-kind run must not sit unflushed for the whole turn: past
+ * AGENT_STREAM_FLUSH_INTERVAL_SEC the coalescer force-flushes even with no
+ * kind change, so a slow/real generation loop still streams live instead of
+ * dumping everything at finish=true (the Layer 4 bug on the ROCm host). */
+static void test_stream_periodic_flush(void) {
+    agent_dsml_parser p = { .syntax = AGENT_TOOL_SYNTAX_DSML, .state = AGENT_DSML_SEARCH };
+    cap_list c = {0};
+    srv_stream s;
+    srv_stream_init(&s, &p, AGENT_TOOL_SYNTAX_DSML, NULL, cap_emit, &c);
+
+    srv_stream_text(&s, "abc", 3, false);
+    CHECK(c.n == 0); /* still buffered, interval not elapsed yet */
+
+    struct timespec d = { 0, (long)(AGENT_STREAM_FLUSH_INTERVAL_SEC * 1.5 * 1e9) };
+    nanosleep(&d, NULL);
+    srv_stream_text(&s, "def", 3, false); /* same kind, but the interval elapsed */
+    /* The proof: a flush already happened here, before finish and with no
+     * kind change -- only AGENT_STREAM_FLUSH_INTERVAL_SEC having elapsed
+     * explains it (without the fix this stays 0 until finish=true). */
+    CHECK(c.n == 1);
+
+    srv_stream_text(&s, NULL, 0, true); /* flushes any lookahead-held tail */
+    CHECK(c.n >= 1 && c.n <= 2);
+    for (size_t i = 0; i < c.n; i++) CHECK(c.v[i].kind == AGENT_STREAM_NORMAL);
+    for (size_t i = 1; i < c.n; i++) CHECK(c.v[i].id > c.v[i - 1].id);
+    /* the marker-lookahead holdback can shift bytes across the two fragments
+     * (e.g. a trailing byte of "abc" held back and released together with
+     * "def"), so only the concatenated content is asserted, not the split. */
+    char joined[16] = {0};
+    for (size_t i = 0; i < c.n; i++) strcat(joined, c.v[i].text);
+    CHECK(strcmp(joined, "abcdef") == 0);
+
+    cap_free(&c);
+    srv_stream_free(&s);
+    agent_dsml_parser_free(&p);
+}
+
 static void test_stream_invalid_tool_call_notice(void) {
     /* a DSML marker in plain assistant text, outside any tool_calls block */
     const char *chunks[] = { "text </\xef\xbd\x9c" "DSML\xef\xbd\x9c more" };
@@ -969,6 +1006,7 @@ int main(void) {
     test_stream_glm_tool_call();
     test_stream_think_is_stripped();
     test_stream_normal_coalesced();
+    test_stream_periodic_flush();
     test_stream_invalid_tool_call_notice();
     test_stream_greedy_sampling_flag();
     test_srv_status_packing();
