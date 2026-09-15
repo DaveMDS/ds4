@@ -574,6 +574,16 @@ typedef struct {
     bool summary_banner_shown;
 } agent_stream_renderer;
 
+/* The one live stream renderer for this process (set once in
+ * client_runtime_init, for both interactive and non-interactive mode).
+ * agent_publish (tool-execution side effects: bash job output echo, the
+ * "unknown tool" notice, etc.) writes straight to the render sink -- unlike
+ * the monolith, which queues everything through one buffer a single UI
+ * thread drains, so tool-viz newline bookkeeping was naturally consistent.
+ * Here agent_publish must explicitly close any open tool visualisation
+ * first, or its text lands glued onto an unfinished "$ command" line. */
+static agent_stream_renderer *g_active_stream = NULL;
+
 
 /* -- tail capture --------------------------------------------------- */
 
@@ -2582,10 +2592,15 @@ static int agent_parse_int_default(const char *s, int def, int min, int max) {
 }
 
 /* Worker-side output: on the client there is no separate UI thread, so this
- * writes straight through the render sink (T9). */
+ * writes straight through the render sink (T9). Close any open tool
+ * visualisation first (see g_active_stream) so this text never lands glued
+ * onto an unfinished "$ command" line -- this is what "bash" output echo
+ * needs it for. */
 static void agent_publish(agent_worker *w, const char *s, size_t n) {
     (void)w;
-    if (n) g_render_sink(s, n);
+    if (!n) return;
+    if (g_active_stream) client_stream_end_tool(g_active_stream);
+    g_render_sink(s, n);
 }
 
 static void agent_publishf(agent_worker *w, const char *fmt, ...) {
@@ -6129,11 +6144,13 @@ static void client_runtime_init(client_runtime *rt, client_conn *co,
     rt->co = co;
     rt->worker = worker;
     client_stream_renderer_init(&rt->stream, rndr, ctx_size);
+    g_active_stream = &rt->stream;
     g_render_sink = client_editor_sink; /* falls back to plain stdout until
                                          * the editor starts (T11c) */
 }
 
 static void client_runtime_free(client_runtime *rt) {
+    if (g_active_stream == &rt->stream) g_active_stream = NULL;
     client_session_list_free(&rt->sessions);
 }
 
@@ -6160,17 +6177,6 @@ static void client_dispatch_push(client_runtime *rt, uint32_t type,
     case AGENT_MSG_STREAM: {
         ap_stream s;
         if (!ap_decode_stream(&r, &s)) return;
-        if (getenv("DS4_DEBUG_STREAM")) {
-            fprintf(stderr, "[STREAM kind=%u len=%u] \"", s.kind,
-                    (unsigned)s.text_len);
-            for (size_t i = 0; i < s.text_len; i++) {
-                char c = s.text[i];
-                if (c == '\n') fputs("\\n", stderr);
-                else if (c == '\t') fputs("\\t", stderr);
-                else fputc(c, stderr);
-            }
-            fprintf(stderr, "\"\n");
-        }
         client_apply_stream_fragment(&rt->stream, s.kind, s.text, s.text_len);
         break;
     }

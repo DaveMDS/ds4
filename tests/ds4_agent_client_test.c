@@ -1633,7 +1633,52 @@ static void test_non_interactive_one_shot_e2e(void) {
     free(dir);
 }
 
+/* Regression for the "hostnamemax" bug: agent_publish (bash job output echo,
+ * the "unknown tool" notice, etc.) writes straight to g_render_sink and must
+ * close any open tool visualisation first, or its text lands glued onto an
+ * unfinished "$ command" line -- see g_active_stream / client_stream_end_tool
+ * in ds4_agent_client.c. */
+static char g_capture_buf[256];
+static size_t g_capture_len;
+
+static void capture_sink(const char *s, size_t n) {
+    if (g_capture_len + n >= sizeof(g_capture_buf)) n = sizeof(g_capture_buf) - 1 - g_capture_len;
+    memcpy(g_capture_buf + g_capture_len, s, n);
+    g_capture_len += n;
+    g_capture_buf[g_capture_len] = '\0';
+}
+
+static void test_agent_publish_closes_open_tool_viz(void) {
+    agent_token_renderer rndr;
+    memset(&rndr, 0, sizeof(rndr));
+    rndr.last_output_newline = true;
+    agent_stream_renderer sr;
+    client_stream_renderer_init(&sr, &rndr, 100000);
+
+    g_capture_len = 0;
+    g_capture_buf[0] = '\0';
+    void (*saved_sink)(const char *, size_t) = g_render_sink;
+    agent_stream_renderer *saved_active = g_active_stream;
+    g_render_sink = capture_sink;
+    g_active_stream = &sr;
+
+    client_apply_stream_fragment(&sr, AGENT_STREAM_TOOL_NAME, "bash", 4);
+    client_apply_stream_fragment(&sr, AGENT_STREAM_TOOL_PARAM_NAME, "command", 7);
+    client_apply_stream_fragment(&sr, AGENT_STREAM_TOOL_PARAM_VALUE, "hostname", 8);
+    /* Simulates agent_bash_publish_observation's direct echo of the command's
+     * captured output, run synchronously while the tool-viz line is still
+     * open (before any STREAM{NORMAL} from the model closes it). */
+    agent_publish(NULL, "max\n", 4);
+
+    g_render_sink = saved_sink;
+    g_active_stream = saved_active;
+
+    CHECK(strstr(g_capture_buf, "hostnamemax") == NULL);
+    CHECK(strstr(g_capture_buf, "hostname\nmax") != NULL);
+}
+
 int main(void) {
+    test_agent_publish_closes_open_tool_viz();
     test_handshake_model_loading();
     test_handshake_new_session();
     test_handshake_resume();
