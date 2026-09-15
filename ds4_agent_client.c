@@ -6160,6 +6160,17 @@ static void client_dispatch_push(client_runtime *rt, uint32_t type,
     case AGENT_MSG_STREAM: {
         ap_stream s;
         if (!ap_decode_stream(&r, &s)) return;
+        if (getenv("DS4_DEBUG_STREAM")) {
+            fprintf(stderr, "[STREAM kind=%u len=%u] \"", s.kind,
+                    (unsigned)s.text_len);
+            for (size_t i = 0; i < s.text_len; i++) {
+                char c = s.text[i];
+                if (c == '\n') fputs("\\n", stderr);
+                else if (c == '\t') fputs("\\t", stderr);
+                else fputc(c, stderr);
+            }
+            fprintf(stderr, "\"\n");
+        }
         client_apply_stream_fragment(&rt->stream, s.kind, s.text, s.text_len);
         break;
     }
