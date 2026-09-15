@@ -6880,15 +6880,17 @@ typedef struct {
 static void *server_loading_heartbeat_main(void *arg) {
     server_heartbeat_ctx *hc = arg;
     double started_at = now_sec();
+    double next_tick = started_at + AGENT_LOADING_HEARTBEAT_INTERVAL_SEC;
     while (!hc->stop) {
         struct timespec d = {0, 100000000L}; /* 100 ms poll for a prompt stop */
         nanosleep(&d, NULL);
         if (hc->stop) break;
-        double elapsed = now_sec() - started_at;
-        if (elapsed + 1e-9 < AGENT_LOADING_HEARTBEAT_INTERVAL_SEC) continue;
-        started_at = now_sec();
+        double now = now_sec();
+        if (now + 1e-9 < next_tick) continue;
+        next_tick += AGENT_LOADING_HEARTBEAT_INTERVAL_SEC;
         char msg[64];
-        snprintf(msg, sizeof(msg), "Loading model... (%ds elapsed)", (int)elapsed);
+        snprintf(msg, sizeof(msg), "Loading model... (%ds elapsed)",
+                (int)(now - started_at));
         agent_publish_system_status(hc->w, msg);
     }
     return NULL;
